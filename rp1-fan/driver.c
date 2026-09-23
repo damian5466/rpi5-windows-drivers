@@ -1,16 +1,17 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 #include <ntddk.h>
 #include <wdf.h>
+#include <wmistr.h>
+#include <wmidata.h>
 #include "hardware.h"
 #include "public.h"
-#include "platform-public.h"
+#include "temperature.h"
 
 typedef struct DEVICE_CONTEXT {
     PUCHAR registers;
     WDFWAITLOCK lock;
     WDFTIMER timer;
     WDFTIMER sensorTimer;
-    WDFIOTARGET sensorTarget;
     WDFFILEOBJECT owner;
     BOOLEAN running;
     FAN_STATE state;
@@ -63,49 +64,40 @@ static void Write32(void *context, uint32_t offset, uint32_t value)
 }
 static uint64_t NowMs(void) { return KeQueryInterruptTime() / 10000; }
 
-/* Called only by the passive sensor timer. Open/query/close on each sample so
- * no persistent remote handle prevents the temperature driver from unloading.
- * The independent watchdog keeps cooling safe even if this path is delayed. */
-static NTSTATUS ReadTemperature(DEVICE_CONTEXT *ctx, int32_t *temperature)
+/* Query the same inbox WMI class that monitoring applications use. No sensor
+ * device names, project GUIDs or private IOCTLs are part of this contract.
+ * Run outside the fan lock: the independent watchdog still applies full
+ * cooling if a provider stalls and the previous sample becomes stale. */
+static NTSTATUS ReadTemperature(int32_t *temperature)
 {
-    PWSTR links = NULL, at;
-    NTSTATUS status = IoGetDeviceInterfaces(&GUID_DEVINTERFACE_PI5_PLATFORM, NULL, 0, &links);
-    NTSTATUS result = STATUS_DEVICE_NOT_READY;
+    static const GUID thermalGuid = MSAcpi_ThermalZoneTemperatureGuid;
+    PVOID block = NULL, buffer = NULL;
+    ULONG length = 0, capacity, attempt;
+    NTSTATUS status;
     *temperature = INT32_MIN;
+    status = IoWMIOpenBlock(&thermalGuid, WMIGUID_QUERY, &block);
     if (!NT_SUCCESS(status)) return status;
-    for (at = links; at && *at;) {
-        UNICODE_STRING name;
-        WDF_IO_TARGET_OPEN_PARAMS open;
-        WDF_MEMORY_DESCRIPTOR output;
-        WDF_REQUEST_SEND_OPTIONS options;
-        ULONG_PTR used = 0;
-        PI5_QUERY q = {0};
-        RtlInitUnicodeString(&name, at);
-        at += name.Length / sizeof(WCHAR) + 1;
-        WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_NAME(&open, &name, GENERIC_READ);
-        open.ShareAccess = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-        status = WdfIoTargetOpen(ctx->sensorTarget, &open);
-        if (!NT_SUCCESS(status)) { result = status; continue; }
-        WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&output, &q, sizeof(q));
-        WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
-        WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&options, WDF_REL_TIMEOUT_IN_MS(100));
-        status = WdfIoTargetSendIoctlSynchronously(ctx->sensorTarget, NULL,
-                         IOCTL_PI5_QUERY, NULL, &output, &options, &used);
-        WdfIoTargetClose(ctx->sensorTarget);
-        if (!NT_SUCCESS(status)) { result = status; continue; }
-        if (used != sizeof(q) || q.size != sizeof(q) || q.version != PI5_ABI_VERSION) {
-            result = STATUS_DEVICE_DATA_ERROR; continue;
+    status = IoWMIQueryAllData(block, &length, NULL);
+    /* Providers can arrive between sizing and querying. Bound both retries
+     * and nonpaged allocation even if a provider reports a corrupt size. */
+    for (attempt = 0; status == STATUS_BUFFER_TOO_SMALL && attempt < 3; ++attempt) {
+        if (length < sizeof(WNODE_ALL_DATA) || length > 64 * 1024) {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            break;
         }
-        if (q.kind != 2) continue; /* The RNG shares the interface class. */
-        if (q.temperature_millicelsius < -40000 || q.temperature_millicelsius > 125000) {
-            result = STATUS_DEVICE_DATA_ERROR; continue;
-        }
-        *temperature = q.temperature_millicelsius;
-        result = STATUS_SUCCESS;
-        break;
+        capacity = length;
+        buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, capacity, 'Tm5P');
+        if (!buffer) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
+        status = IoWMIQueryAllData(block, &length, buffer);
+        if (NT_SUCCESS(status) && (length > capacity ||
+            !fan_temperature_parse(buffer, length, temperature)))
+            status = STATUS_DEVICE_DATA_ERROR;
+        ExFreePoolWithTag(buffer, 'Tm5P');
+        buffer = NULL;
     }
-    if (links) ExFreePool(links);
-    return result;
+    ObDereferenceObject(block);
+    if (NT_SUCCESS(status) && *temperature == INT32_MIN) status = STATUS_DEVICE_NOT_READY;
+    return status;
 }
 
 static NTSTATUS CheckIdentity(PWDFDEVICE_INIT init)
@@ -185,8 +177,6 @@ NTSTATUS FanDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT init)
     WDF_TIMER_CONFIG_INIT(&timer, FanTemperature);
     timer.AutomaticSerialization = FALSE;
     status = WdfTimerCreate(&timer, &attributes, &ctx->sensorTimer);
-    if (!NT_SUCCESS(status)) return status;
-    status = WdfIoTargetCreate(device, WDF_NO_OBJECT_ATTRIBUTES, &ctx->sensorTarget);
     if (!NT_SUCCESS(status)) return status;
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queue, WdfIoQueueDispatchSequential);
     queue.PowerManaged = WdfTrue;
@@ -318,14 +308,17 @@ VOID FanTemperature(WDFTIMER timer)
 {
     DEVICE_CONTEXT *ctx = DeviceContext((WDFDEVICE)WdfTimerGetParentObject(timer));
     int32_t temperature;
+    uint64_t sampleTime;
     NTSTATUS status;
     (void)WdfWaitLockAcquire(ctx->lock, NULL);
     if (!ctx->running) { WdfWaitLockRelease(ctx->lock); return; }
     WdfWaitLockRelease(ctx->lock);
-    status = ReadTemperature(ctx, &temperature);
+    sampleTime = NowMs();
+    status = ReadTemperature(&temperature);
     (void)WdfWaitLockAcquire(ctx->lock, NULL);
     if (ctx->running) {
-        fan_policy_temperature(&ctx->policy, temperature, NowMs());
+        /* A slow query must not make an old reading appear fresh. */
+        fan_policy_temperature(&ctx->policy, temperature, sampleTime);
         ctx->temperatureStatus = status;
         (void)WdfTimerStart(timer, WDF_REL_TIMEOUT_IN_MS(1000));
     }

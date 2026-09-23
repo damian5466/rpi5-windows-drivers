@@ -120,9 +120,6 @@ foreach ($name in $names) {
     $work = Join-Path $Output ('.work\' + $name + '-' + [Guid]::NewGuid().ToString('N'))
     New-Item $work -ItemType Directory -Force | Out-Null
     Get-ChildItem $source -File | Where-Object { $_.Extension -in '.c','.h','.inf' } | Copy-Item -Destination $work
-    if ($name -eq 'rp1-fan') {
-        Copy-Item (Join-Path $PSScriptRoot 'bcm2712-platform\public.h') (Join-Path $work 'platform-public.h')
-    }
     if ($name -eq 'pi5-nvram') {
         New-Item (Join-Path $work 'Library') -ItemType Directory | Out-Null
         Copy-Item "$firmware\Library\NvramFileLib\NvramFileLib.c" $work
@@ -132,10 +129,11 @@ foreach ($name in $names) {
     $sources = switch ($name) {
         'rp1-ethernet' { 'miniport.c gem.c' }
         'pi5-nvram' { 'driver.c NvramFileLib.c' }
+        'rp1-fan' { 'driver.c hardware.c temperature.c' }
         default { 'driver.c hardware.c' }
     }
     $objects = $sources.Replace('.c', '.obj')
-    $defines = '/D_ARM64_ /D_ARM64_WINAPI_PARTITION_DESKTOP_SDK_AVAILABLE=1 /DNTDDI_VERSION=0x0A000008 /D_WIN32_WINNT=0x0A00'
+    $defines = '/D_ARM64_ /DWINNT=1 /D_ARM64_WINAPI_PARTITION_DESKTOP_SDK_AVAILABLE=1 /DNTDDI_VERSION=0x0A000008 /D_WIN32_WINNT=0x0A00'
     $includes = '/I"' + $kernelInclude + '" /I"' + $work + '"'
     $libraries = '/LIBPATH:"' + $kernelLib + '" ntoskrnl.lib hal.lib BufferOverflowFastFailK.lib'
     $entry = 'GsDriverEntry'
