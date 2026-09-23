@@ -4,7 +4,7 @@ Signature="$WINDOWS NT$"
 Class=System
 ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider=%Provider%
-DriverVer=09/20/2026,0.1.0.3
+DriverVer=09/23/2026,0.2.0.0
 CatalogFile=pi5platform.cat
 PnpLockdown=1
 

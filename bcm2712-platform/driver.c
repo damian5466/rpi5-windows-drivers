@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 #include <ntddk.h>
 #include <wdf.h>
+#include <wmidata.h>
 #include "hardware.h"
 #include "public.h"
 
@@ -9,6 +10,8 @@ typedef struct DEVICE_CONTEXT {
     ULONG length;
     unsigned kind;
     PI5_RNG_STATE rng;
+    WDFWAITLOCK thermalLock;
+    BOOLEAN thermalRunning;
 } DEVICE_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceContext)
 
@@ -23,7 +26,11 @@ EVT_WDF_DRIVER_DEVICE_ADD Pi5DeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE Pi5PrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE Pi5ReleaseHardware;
 EVT_WDF_DEVICE_D0_ENTRY Pi5D0Entry;
+EVT_WDF_DEVICE_D0_EXIT Pi5D0Exit;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL Pi5DeviceControl;
+EVT_WDF_WMI_INSTANCE_QUERY_INSTANCE Pi5TemperatureQuery;
+
+static const GUID ThermalGuid = MSAcpi_ThermalZoneTemperatureGuid;
 
 static void DiagnosticValue(WDFDEVICE device, PCWSTR name, ULONG type,
                             ULONG length, PVOID value)
@@ -66,6 +73,43 @@ static uint64_t NowMs(void *context)
 {
     UNREFERENCED_PARAMETER(context);
     return KeQueryInterruptTime() / 10000;
+}
+
+/* WMI callbacks are not power-managed I/O queue callbacks. Serialize sensor
+ * access with D0 exit/release explicitly, and never return a cached reading. */
+static NTSTATUS ReadTemperature(DEVICE_CONTEXT *ctx, uint32_t *raw, int32_t *temperature)
+{
+    NTSTATUS status = STATUS_DEVICE_NOT_READY;
+    (void)WdfWaitLockAcquire(ctx->thermalLock, NULL);
+    if (ctx->thermalRunning && ctx->registers) {
+        *raw = READ_REGISTER_ULONG((PULONG)(ctx->registers + PI5_TEMP_STATUS));
+        status = ResultStatus(pi5_temperature_decode(*raw, temperature));
+    }
+    WdfWaitLockRelease(ctx->thermalLock);
+    return status;
+}
+
+_Use_decl_annotations_
+NTSTATUS Pi5TemperatureQuery(WDFWMIINSTANCE instance, ULONG length,
+                             PVOID buffer, PULONG used)
+{
+    DEVICE_CONTEXT *ctx = DeviceContext(WdfWmiInstanceGetDevice(instance));
+    MSAcpi_ThermalZoneTemperature *data = buffer;
+    uint32_t raw;
+    int32_t temperature;
+    NTSTATUS status;
+    *used = sizeof(*data);
+    if (length < sizeof(*data)) return STATUS_BUFFER_TOO_SMALL;
+    *used = 0;
+    status = ReadTemperature(ctx, &raw, &temperature);
+    if (!NT_SUCCESS(status)) return status;
+    RtlZeroMemory(data, sizeof(*data));
+    /* The inbox WMI schema uses tenths of a kelvin, rounded to nearest.
+     * Trip points/constants stay zero: this is a read-only monitor, not an
+     * ACPI thermal policy that implements throttling or critical shutdown. */
+    data->CurrentTemperature = (ULONG)((temperature + 273150 + 50) / 100);
+    *used = sizeof(*data);
+    return STATUS_SUCCESS;
 }
 
 static void WaitForFifo(void *context)
@@ -160,6 +204,7 @@ NTSTATUS Pi5DeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT init)
     pnp.EvtDevicePrepareHardware = Pi5PrepareHardware;
     pnp.EvtDeviceReleaseHardware = Pi5ReleaseHardware;
     pnp.EvtDeviceD0Entry = Pi5D0Entry;
+    pnp.EvtDeviceD0Exit = Pi5D0Exit;
     WdfDeviceInitSetPnpPowerEventCallbacks(init, &pnp);
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, DEVICE_CONTEXT);
     attributes.ExecutionLevel = WdfExecutionLevelPassive;
@@ -167,6 +212,23 @@ NTSTATUS Pi5DeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT init)
     status = WdfDeviceCreate(&init, &attributes, &device);
     if (!NT_SUCCESS(status)) return status;
     DeviceContext(device)->kind = kind;
+    if (kind == PI5_KIND_THERMAL) {
+        WDF_WMI_PROVIDER_CONFIG provider;
+        WDF_WMI_INSTANCE_CONFIG instance;
+        WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+        attributes.ParentObject = device;
+        status = WdfWaitLockCreate(&attributes, &DeviceContext(device)->thermalLock);
+        if (!NT_SUCCESS(status)) return status;
+        /* Reuse the Windows-supplied WMI class; no private MOF or client SDK. */
+        WDF_WMI_PROVIDER_CONFIG_INIT(&provider, &ThermalGuid);
+        provider.MinInstanceBufferSize = sizeof(MSAcpi_ThermalZoneTemperature);
+        WDF_WMI_INSTANCE_CONFIG_INIT_PROVIDER_CONFIG(&instance, &provider);
+        instance.Register = TRUE;
+        instance.EvtWmiInstanceQueryInstance = Pi5TemperatureQuery;
+        status = WdfWmiInstanceCreate(device, &instance, WDF_NO_OBJECT_ATTRIBUTES,
+                                       WDF_NO_HANDLE);
+        if (!NT_SUCCESS(status)) return status;
+    }
     Diagnostic(device, L"DiagStage", 10);
     Diagnostic(device, L"DiagKind", kind);
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queue, WdfIoQueueDispatchSequential);
@@ -222,10 +284,13 @@ NTSTATUS Pi5ReleaseHardware(WDFDEVICE device, WDFCMRESLIST translated)
 {
     DEVICE_CONTEXT *ctx = DeviceContext(device);
     UNREFERENCED_PARAMETER(translated);
+    if (ctx->thermalLock) (void)WdfWaitLockAcquire(ctx->thermalLock, NULL);
+    ctx->thermalRunning = FALSE;
     if (ctx->registers) {
         MmUnmapIoSpace(ctx->registers, ctx->length);
         ctx->registers = NULL;
     }
+    if (ctx->thermalLock) WdfWaitLockRelease(ctx->thermalLock);
     return STATUS_SUCCESS;
 }
 
@@ -242,6 +307,9 @@ NTSTATUS Pi5D0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE previous)
         int32_t temperature;
         uint32_t raw = Read32(&requestIo, PI5_TEMP_STATUS);
         NTSTATUS status = ResultStatus(pi5_temperature_decode(raw, &temperature));
+        (void)WdfWaitLockAcquire(ctx->thermalLock, NULL);
+        ctx->thermalRunning = NT_SUCCESS(status);
+        WdfWaitLockRelease(ctx->thermalLock);
         Diagnostic(device, L"DiagTemperatureRaw", raw);
         Diagnostic(device, L"DiagStatus", (ULONG)status);
         return status;
@@ -256,6 +324,19 @@ NTSTATUS Pi5D0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE previous)
         Diagnostic(device, L"DiagStatus", (ULONG)status);
         return status;
     }
+}
+
+_Use_decl_annotations_
+NTSTATUS Pi5D0Exit(WDFDEVICE device, WDF_POWER_DEVICE_STATE target)
+{
+    DEVICE_CONTEXT *ctx = DeviceContext(device);
+    UNREFERENCED_PARAMETER(target);
+    if (ctx->thermalLock) {
+        (void)WdfWaitLockAcquire(ctx->thermalLock, NULL);
+        ctx->thermalRunning = FALSE;
+        WdfWaitLockRelease(ctx->thermalLock);
+    }
+    return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
@@ -280,9 +361,8 @@ VOID Pi5DeviceControl(WDFQUEUE queue, WDFREQUEST request, size_t outputLength,
         query->version = PI5_ABI_VERSION;
         query->kind = ctx->kind;
         if (ctx->kind == PI5_KIND_THERMAL) {
-            query->temperature_raw = Read32(&requestIo, PI5_TEMP_STATUS);
-            status = ResultStatus(pi5_temperature_decode(query->temperature_raw,
-                                  &query->temperature_millicelsius));
+            status = ReadTemperature(ctx, &query->temperature_raw,
+                                      &query->temperature_millicelsius);
         } else {
             query->rng_control = Read32(&requestIo, PI5_RNG_CONTROL);
             query->rng_status = Read32(&requestIo, PI5_RNG_STATUS);
