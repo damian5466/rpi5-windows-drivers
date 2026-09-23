@@ -2,7 +2,8 @@
 
 RP1 is one driver package with cooperating function drivers. Windows loads
 GPIO through GpioClx, UART through SerCx2, and I²C/SPI through SpbCx. Shared
-interrupt and clock providers own the common registers. Existing Ethernet and
+interrupt and clock providers own the common registers. Ethernet also leases
+its interrupt route from the provider (version 0.3.0.0 or later). Ethernet and
 fan drivers remain part of the package. A future function can use the same
 providers without duplicating register ownership or replacing the whole RP1.
 

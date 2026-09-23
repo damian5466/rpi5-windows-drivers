@@ -4,7 +4,7 @@ Signature="$WINDOWS NT$"
 Class=Net
 ClassGuid={4d36e972-e325-11ce-bfc1-08002be10318}
 Provider=%Provider%
-DriverVer=09/21/2026,0.1.0.3
+DriverVer=09/23/2026,0.3.0.1
 CatalogFile=pi5ethernet.cat
 PnpLockdown=1
 

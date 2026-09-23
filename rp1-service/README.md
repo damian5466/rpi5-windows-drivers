@@ -7,6 +7,9 @@ already-owned/enabled source and never changes the firmware's USB routes.
 All clients still handle their own hardware interrupt status on the shared GIC
 interrupt. See [package architecture](../RP1-HEADER.md).
 
+Version 0.3.0.0 also permits Ethernet source 6. The Ethernet miniport holds the
+same per-file lease as header clients; USB sources remain excluded.
+
 The driver maps only the interrupt configuration page from its translated
 resources. It does not reset RP1, claim SRAM, alter MIP, or enable every device.
 The admin/system-only `\\.\Pi5Rp1` endpoint permits a read-only status query;
