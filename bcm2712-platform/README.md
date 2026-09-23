@@ -15,6 +15,12 @@ signing instructions. Run the commands below from the repository root.
 The package is written to `Build/bcm2712-platform`, with `Pi5Platform.sys` and
 `pi5platform.inf`.
 
+Version 0.3 selects RNG versus temperature through the INF's `DeviceKind`
+hardware-key value (1/2). It accepts the existing firmware IDs, including the
+new revision-qualified variants, without parsing the hardware-ID list. Install
+the SYS and INF from the same package; the MMIO validation and public/WMI
+interfaces are unchanged.
+
 ## Temperature monitoring
 
 The platform driver publishes the BCM2712 sensor through Windows' built-in
