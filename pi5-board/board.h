@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+#pragma once
+#define PI5_BOARD_NAME L"\\Device\\Pi5Board"
+#define PI5_BOARD_VERSION 1u
+#define PI5_BOARD_WIFI 0u
+#define PI5_BOARD_SD 1u
+#define PI5_BOARD_ACTIVITY 2u
+#define PI5_BOARD_ETHERNET 3u
+#define PI5_BOARD_CAMERA0 4u
+#define PI5_BOARD_POWER_LED 5u
+#define PI5_BOARD_CAMERA1 6u
+#define PI5_BOARD_PINS 7u
+#define PI5_BOARD_ALWAYS_ON ((1u << PI5_BOARD_WIFI) | (1u << PI5_BOARD_SD) | (1u << PI5_BOARD_ETHERNET))
+#define PI5_BOARD_LEDS ((1u << PI5_BOARD_ACTIVITY) | (1u << PI5_BOARD_POWER_LED))
+#define IOCTL_PI5_BOARD_QUERY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x840, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_PI5_BOARD_SET CTL_CODE(FILE_DEVICE_UNKNOWN, 0x841, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_PI5_BOARD_RELEASE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x842, METHOD_BUFFERED, FILE_WRITE_DATA)
+typedef struct { ULONG Version, Pin, Asserted, Reserved; } PI5_BOARD_SET;
+typedef struct {
+    ULONG Version, Size, Configured, Leased, Levels, Readable, AlwaysOn, Reserved;
+} PI5_BOARD_STATUS;
