@@ -1,7 +1,7 @@
 # Raspberry Pi 5 Windows ARM64 drivers
 
 Experimental drivers for the RP1 40-pin header, Ethernet and fan control,
-BCM2712 temperature/RNG, and file-backed UEFI variable persistence, plus a
+BCM2712 GPIO and temperature/RNG, board controls, and file-backed UEFI variable persistence, plus a
 reproducible stock NVMe patch.
 Use these drivers with the matching [rpi5-uefi firmware](https://github.com/damian5466/rpi5-uefi).
 
@@ -21,6 +21,8 @@ Drivers are tested against Windows 11 build 26100.9539.
 | RP1 SPI | [rp1-spi](rp1-spi/README.md) |
 | RP1 Ethernet | [rp1-ethernet](rp1-ethernet/README.md) |
 | BCM2712 temperature and RNG | [bcm2712-platform](bcm2712-platform/README.md) |
+| BCM2712 GPIO and power button | [bcm2712-gpio](bcm2712-gpio/README.md) |
+| Board supplies, LEDs and camera enables | [pi5-board](pi5-board/README.md) |
 | RP1 PWM fan control | [rp1-fan](rp1-fan/README.md) |
 | File-backed UEFI variable persistence | [pi5-nvram](pi5-nvram/README.md) |
 | Stock NVMe compatibility patch | [nvme](nvme/README.md) |

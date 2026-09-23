@@ -5,9 +5,12 @@
 #include <gpioclx.h>
 
 #define RP1_HEADER_PINS 28u
-// GPIO0/1 are the HAT identification bus. Board-internal GPIO28..53 are
-// deliberately not exported by this header controller.
+#define RP1_TOTAL_PINS 54u
+// Only ACPI-assigned board controls are added. HAT ID, fan, PCIe and all
+// other internal pins remain unavailable; board pins have no IRQ/function API.
 #define RP1_HEADER_MASK 0x0ffffffcu
+#define RP1_BOARD_MASK ((1ull << 32) | (1ull << 34) | (1ull << 44) | (1ull << 46))
+#define RP1_ALLOWED_MASK (RP1_HEADER_MASK | RP1_BOARD_MASK)
 #define RP1_SET 0x2000u
 #define RP1_CLEAR 0x3000u
 #define RP1_CTRL(n) (4u + 8u * (n))
@@ -31,8 +34,9 @@ typedef struct {
     WDFDEVICE Device;
     WDFIOTARGET Route;
     PUCHAR Io, Rio, Pads;
-    RP1_PIN_STATE Boot[RP1_HEADER_PINS], Resume[RP1_HEADER_PINS];
-    ULONG IoOwned, OutputOwned, IrqOwned, FunctionOwned, Touched, ResumeInte;
+    RP1_PIN_STATE Boot[RP1_TOTAL_PINS], Resume[RP1_TOTAL_PINS];
+    ULONGLONG IoOwned, OutputOwned, FunctionOwned, Touched;
+    ULONG IrqOwned, ResumeInte;
     BOOLEAN Started;
 } GPIO_CONTEXT;
 
@@ -40,8 +44,11 @@ ULONG GpioRead(PUCHAR Base, ULONG Offset);
 VOID GpioWrite(PUCHAR Base, ULONG Offset, ULONG Value);
 VOID GpioSnapshot(GPIO_CONTEXT *c, ULONG pin, RP1_PIN_STATE *state);
 VOID GpioRestore(GPIO_CONTEXT *c, ULONG pin, const RP1_PIN_STATE *state);
-NTSTATUS GpioPinMask(BANK_ID Bank, const PIN_NUMBER *Pins, ULONG Count, ULONG *Mask);
-NTSTATUS GpioCanClaim(GPIO_CONTEXT *c, ULONG Mask);
+NTSTATUS GpioPinMask(BANK_ID Bank, const PIN_NUMBER *Pins, ULONG Count, ULONGLONG *Mask);
+NTSTATUS GpioIrqPinMask(BANK_ID Bank, PIN_NUMBER Pin, ULONG *Mask);
+NTSTATUS GpioCanClaim(GPIO_CONTEXT *c, ULONGLONG Mask);
+ULONGLONG GpioReadValues(GPIO_CONTEXT *c, BOOLEAN Output);
+VOID GpioWriteValues(GPIO_CONTEXT *c, ULONGLONG Set, ULONGLONG Clear);
 VOID GpioConfigure(GPIO_CONTEXT *c, ULONG Pin, ULONG Function, BOOLEAN Output, UCHAR Pull, USHORT Drive);
 NTSTATUS GpioTrigger(KINTERRUPT_MODE Mode, KINTERRUPT_POLARITY Polarity, ULONG *Events);
 

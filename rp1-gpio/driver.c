@@ -76,10 +76,9 @@ NTSTATUS GpioPrepare(WDFDEVICE Device, PVOID Context, WDFCMRESLIST Raw, WDFCMRES
         }
     }
     if (count != 3 || interrupts != 1) return STATUS_DEVICE_CONFIGURATION_ERROR;
-    // Only map bank zero. No board-internal pin or pad register is accessed.
-    c->Io = MmMapIoSpaceEx(registers[0]->u.Memory.Start, 0x4000, PAGE_READWRITE | PAGE_NOCACHE);
-    c->Rio = MmMapIoSpaceEx(registers[1]->u.Memory.Start, 0x4000, PAGE_READWRITE | PAGE_NOCACHE);
-    c->Pads = MmMapIoSpaceEx(registers[2]->u.Memory.Start, 0x4000, PAGE_READWRITE | PAGE_NOCACHE);
+    c->Io = MmMapIoSpaceEx(registers[0]->u.Memory.Start, 0xc000, PAGE_READWRITE | PAGE_NOCACHE);
+    c->Rio = MmMapIoSpaceEx(registers[1]->u.Memory.Start, 0xc000, PAGE_READWRITE | PAGE_NOCACHE);
+    c->Pads = MmMapIoSpaceEx(registers[2]->u.Memory.Start, 0xc000, PAGE_READWRITE | PAGE_NOCACHE);
     if (!c->Io || !c->Rio || !c->Pads) {
         (void)GpioRelease(Device, Context);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -88,7 +87,8 @@ NTSTATUS GpioPrepare(WDFDEVICE Device, PVOID Context, WDFCMRESLIST Raw, WDFCMRES
         (void)GpioRelease(Device, Context);
         return STATUS_DEVICE_BUSY;
     }
-    for (i = 0; i < RP1_HEADER_PINS; ++i) GpioSnapshot(c, i, &c->Boot[i]);
+    for (i = 2; i < RP1_TOTAL_PINS; ++i)
+        if (RP1_ALLOWED_MASK & (1ull << i)) GpioSnapshot(c, i, &c->Boot[i]);
     return STATUS_SUCCESS;
 }
 _Use_decl_annotations_
@@ -97,9 +97,9 @@ NTSTATUS GpioRelease(WDFDEVICE Device, PVOID Context)
     GPIO_CONTEXT *c = Context;
     UNREFERENCED_PARAMETER(Device);
     if (c->Route) { WdfObjectDelete(c->Route); c->Route = NULL; }
-    if (c->Io) { MmUnmapIoSpace(c->Io, 0x4000); c->Io = NULL; }
-    if (c->Rio) { MmUnmapIoSpace(c->Rio, 0x4000); c->Rio = NULL; }
-    if (c->Pads) { MmUnmapIoSpace(c->Pads, 0x4000); c->Pads = NULL; }
+    if (c->Io) { MmUnmapIoSpace(c->Io, 0xc000); c->Io = NULL; }
+    if (c->Rio) { MmUnmapIoSpace(c->Rio, 0xc000); c->Rio = NULL; }
+    if (c->Pads) { MmUnmapIoSpace(c->Pads, 0xc000); c->Pads = NULL; }
     return STATUS_SUCCESS;
 }
 _Use_decl_annotations_
@@ -109,8 +109,8 @@ NTSTATUS GpioInformation(PVOID Context, PCLIENT_CONTROLLER_BASIC_INFORMATION Inf
     RtlZeroMemory(Information, sizeof(*Information));
     Information->Version = GPIO_CONTROLLER_BASIC_INFORMATION_VERSION;
     Information->Size = sizeof(*Information);
-    Information->TotalPins = RP1_HEADER_PINS;
-    Information->NumberOfPinsPerBank = RP1_HEADER_PINS;
+    Information->TotalPins = RP1_TOTAL_PINS;
+    Information->NumberOfPinsPerBank = RP1_TOTAL_PINS;
     Information->Flags.MemoryMappedController = 1;
     Information->Flags.FormatIoRequestsAsMasks = 1;
     Information->Flags.EmulateDebouncing = 1;
@@ -136,8 +136,8 @@ NTSTATUS GpioStart(PVOID Context, BOOLEAN RestoreContext, WDF_POWER_DEVICE_STATE
     status = Rp1OpenInterruptRoute(c->Device, 0, &c->Route);
     if (!NT_SUCCESS(status)) return status;
     if (RestoreContext) {
-        for (pin = 2; pin < RP1_HEADER_PINS; ++pin)
-            if (c->Touched & (1u << pin)) GpioRestore(c, pin, &c->Resume[pin]);
+        for (pin = 2; pin < RP1_TOTAL_PINS; ++pin)
+            if (c->Touched & (1ull << pin)) GpioRestore(c, pin, &c->Resume[pin]);
         GpioWrite(c->Io, RP1_SET + RP1_INTE, c->ResumeInte);
     }
     c->Started = TRUE;
@@ -152,33 +152,35 @@ NTSTATUS GpioStop(PVOID Context, BOOLEAN SaveContext, WDF_POWER_DEVICE_STATE Tar
     UNREFERENCED_PARAMETER(Target);
     if (SaveContext) {
         c->ResumeInte = GpioRead(c->Io, RP1_INTE) & c->IrqOwned;
-        for (pin = 2; pin < RP1_HEADER_PINS; ++pin)
-            if (c->Touched & (1u << pin)) GpioSnapshot(c, pin, &c->Resume[pin]);
+        for (pin = 2; pin < RP1_TOTAL_PINS; ++pin)
+            if (c->Touched & (1ull << pin)) GpioSnapshot(c, pin, &c->Resume[pin]);
     }
     GpioWrite(c->Io, RP1_CLEAR + RP1_INTE, c->IrqOwned);
-    for (pin = 2; pin < RP1_HEADER_PINS; ++pin)
-        if (c->Touched & (1u << pin)) GpioRestore(c, pin, &c->Boot[pin]);
+    for (pin = 2; pin < RP1_TOTAL_PINS; ++pin)
+        if (c->Touched & (1ull << pin)) GpioRestore(c, pin, &c->Boot[pin]);
     c->Started = FALSE;
     if (c->Route) { WdfObjectDelete(c->Route); c->Route = NULL; }
     return STATUS_SUCCESS;
 }
 
-static VOID RestoreUnowned(GPIO_CONTEXT *c, ULONG mask)
+static VOID RestoreUnowned(GPIO_CONTEXT *c, ULONGLONG mask)
 {
     ULONG pin;
     mask &= ~(c->IoOwned | c->IrqOwned | c->FunctionOwned);
-    for (pin = 2; pin < RP1_HEADER_PINS; ++pin) if (mask & (1u << pin)) {
+    for (pin = 2; pin < RP1_TOTAL_PINS; ++pin) if (mask & (1ull << pin)) {
         GpioRestore(c, pin, &c->Boot[pin]);
-        c->Touched &= ~(1u << pin);
+        c->Touched &= ~(1ull << pin);
     }
 }
 _Use_decl_annotations_
 NTSTATUS GpioConnect(PVOID Context, PGPIO_CONNECT_IO_PINS_PARAMETERS p)
 {
     GPIO_CONTEXT *c = Context;
-    ULONG mask, pin;
+    ULONGLONG mask;
+    ULONG pin;
     NTSTATUS status = GpioPinMask(p->BankId, p->PinNumberTable, p->PinCount, &mask);
     if (!NT_SUCCESS(status)) return status;
+    if ((mask & RP1_BOARD_MASK) && p->ConnectMode != ConnectModeOutput) return STATUS_NOT_SUPPORTED;
     if ((p->ConnectMode != ConnectModeInput && p->ConnectMode != ConnectModeOutput) ||
         p->PullConfiguration > GPIO_PIN_PULL_CONFIGURATION_NONE || p->VendorDataLength ||
         (p->DriveStrength && p->DriveStrength != 200 && p->DriveStrength != 400 &&
@@ -189,7 +191,7 @@ NTSTATUS GpioConnect(PVOID Context, PGPIO_CONNECT_IO_PINS_PARAMETERS p)
     if ((mask & (c->IoOwned | c->FunctionOwned)) ||
         (p->ConnectMode == ConnectModeOutput && (mask & c->IrqOwned))) status = STATUS_SHARING_VIOLATION;
     else {
-        for (pin = 2; pin < RP1_HEADER_PINS; ++pin) if (mask & (1u << pin))
+        for (pin = 2; pin < RP1_TOTAL_PINS; ++pin) if (mask & (1ull << pin))
             GpioConfigure(c, pin, 5, p->ConnectMode == ConnectModeOutput, p->PullConfiguration, p->DriveStrength);
         c->IoOwned |= mask;
         if (p->ConnectMode == ConnectModeOutput) c->OutputOwned |= mask;
@@ -201,7 +203,7 @@ _Use_decl_annotations_
 NTSTATUS GpioDisconnect(PVOID Context, PGPIO_DISCONNECT_IO_PINS_PARAMETERS p)
 {
     GPIO_CONTEXT *c = Context;
-    ULONG mask;
+    ULONGLONG mask;
     NTSTATUS status = GpioPinMask(p->BankId, p->PinNumberTable, p->PinCount, &mask);
     if (!NT_SUCCESS(status)) return status;
     GPIO_CLX_AcquireInterruptLock(Context, 0);
@@ -217,7 +219,7 @@ NTSTATUS GpioReadPins(PVOID Context, PGPIO_READ_PINS_MASK_PARAMETERS p)
     if (p->BankId || !c->Started) return STATUS_INVALID_PARAMETER;
     // GpioClx also reads interrupt-only pins for active-both emulation.
     // It applies the caller's connection mask after this bank-wide read.
-    *p->PinValues = GpioRead(c->Rio, p->Flags.WriteConfiguredPins ? RP1_OUT : RP1_IN) & RP1_HEADER_MASK;
+    *p->PinValues = GpioReadValues(c, p->Flags.WriteConfiguredPins != 0);
     return STATUS_SUCCESS;
 }
 _Use_decl_annotations_
@@ -226,11 +228,9 @@ NTSTATUS GpioWritePins(PVOID Context, PGPIO_WRITE_PINS_MASK_PARAMETERS p)
     GPIO_CONTEXT *c = Context;
     // The class extension can prime the output latch before connecting the
     // output. Pin access is arbitrated by GpioClx; do not require OutputOwned.
-    if (p->BankId || !c->Started || ((p->SetMask | p->ClearMask) & ~(ULONGLONG)RP1_HEADER_MASK) ||
+    if (p->BankId || !c->Started || ((p->SetMask | p->ClearMask) & ~RP1_ALLOWED_MASK) ||
         (p->SetMask & p->ClearMask)) return STATUS_INVALID_PARAMETER;
-    GpioWrite(c->Rio, RP1_CLEAR + RP1_OUT, (ULONG)p->ClearMask);
-    GpioWrite(c->Rio, RP1_SET + RP1_OUT, (ULONG)p->SetMask);
-    (void)GpioRead(c->Rio, RP1_OUT);
+    GpioWriteValues(c, p->SetMask, p->ClearMask);
     return STATUS_SUCCESS;
 }
 
@@ -239,7 +239,7 @@ NTSTATUS GpioEnableInterrupt(PVOID Context, PGPIO_ENABLE_INTERRUPT_PARAMETERS p)
 {
     GPIO_CONTEXT *c = Context;
     ULONG bit, events;
-    NTSTATUS status = GpioPinMask(p->BankId, &p->PinNumber, 1, &bit);
+    NTSTATUS status = GpioIrqPinMask(p->BankId, p->PinNumber, &bit);
     if (!NT_SUCCESS(status)) return status;
     if (p->PullConfiguration > GPIO_PIN_PULL_CONFIGURATION_NONE || p->VendorDataLength)
         return STATUS_NOT_SUPPORTED;
@@ -266,7 +266,7 @@ NTSTATUS GpioDisableInterrupt(PVOID Context, PGPIO_DISABLE_INTERRUPT_PARAMETERS 
 {
     GPIO_CONTEXT *c = Context;
     ULONG bit;
-    NTSTATUS status = GpioPinMask(p->BankId, &p->PinNumber, 1, &bit);
+    NTSTATUS status = GpioIrqPinMask(p->BankId, p->PinNumber, &bit);
     if (!NT_SUCCESS(status)) return status;
     GPIO_CLX_AcquireInterruptLock(Context, 0);
     GpioWrite(c->Io, RP1_CLEAR + RP1_INTE, bit);
@@ -295,7 +295,7 @@ NTSTATUS GpioUnmaskInterrupt(PVOID Context, PGPIO_ENABLE_INTERRUPT_PARAMETERS p)
 {
     GPIO_CONTEXT *c = Context;
     ULONG bit;
-    NTSTATUS status = GpioPinMask(p->BankId, &p->PinNumber, 1, &bit);
+    NTSTATUS status = GpioIrqPinMask(p->BankId, p->PinNumber, &bit);
     if (!NT_SUCCESS(status)) return status;
     GpioWrite(c->Io, RP1_SET + RP1_INTE, bit);
     (void)GpioRead(c->Io, RP1_INTE);
@@ -337,7 +337,7 @@ NTSTATUS GpioReconfigureInterrupt(PVOID Context, PGPIO_RECONFIGURE_INTERRUPTS_PA
 {
     GPIO_CONTEXT *c = Context;
     ULONG bit, events, enabled;
-    NTSTATUS status = GpioPinMask(p->BankId, &p->PinNumber, 1, &bit);
+    NTSTATUS status = GpioIrqPinMask(p->BankId, p->PinNumber, &bit);
     if (!NT_SUCCESS(status)) return status;
     status = GpioTrigger(p->InterruptMode, p->Polarity, &events);
     if (!NT_SUCCESS(status)) return status;
@@ -354,10 +354,11 @@ _Use_decl_annotations_
 NTSTATUS GpioConnectFunction(PVOID Context, PGPIO_CONNECT_FUNCTION_CONFIG_PINS_PARAMETERS p)
 {
     GPIO_CONTEXT *c = Context;
-    ULONG mask, pin;
+    ULONGLONG mask;
+    ULONG pin;
     NTSTATUS status = GpioPinMask(p->BankId, p->PinNumberTable, p->PinCount, &mask);
     if (!NT_SUCCESS(status)) return status;
-    if (p->FunctionNumber > 8 || p->FunctionNumber == 5 ||
+    if ((mask & RP1_BOARD_MASK) || p->FunctionNumber > 8 || p->FunctionNumber == 5 ||
         p->PullConfiguration > GPIO_PIN_PULL_CONFIGURATION_NONE || p->VendorDataLength)
         return STATUS_NOT_SUPPORTED;
     status = GpioCanClaim(c, mask);
@@ -365,7 +366,7 @@ NTSTATUS GpioConnectFunction(PVOID Context, PGPIO_CONNECT_FUNCTION_CONFIG_PINS_P
     GPIO_CLX_AcquireInterruptLock(Context, 0);
     if (mask & (c->IoOwned | c->IrqOwned | c->FunctionOwned)) status = STATUS_SHARING_VIOLATION;
     else {
-        for (pin = 2; pin < RP1_HEADER_PINS; ++pin) if (mask & (1u << pin))
+        for (pin = 2; pin < RP1_HEADER_PINS; ++pin) if (mask & (1ull << pin))
             GpioConfigure(c, pin, p->FunctionNumber, FALSE, p->PullConfiguration, 0);
         c->FunctionOwned |= mask;
     }
@@ -376,7 +377,7 @@ _Use_decl_annotations_
 NTSTATUS GpioDisconnectFunction(PVOID Context, PGPIO_DISCONNECT_FUNCTION_CONFIG_PINS_PARAMETERS p)
 {
     GPIO_CONTEXT *c = Context;
-    ULONG mask;
+    ULONGLONG mask;
     NTSTATUS status = GpioPinMask(p->BankId, p->PinNumberTable, p->PinCount, &mask);
     if (!NT_SUCCESS(status)) return status;
     GPIO_CLX_AcquireInterruptLock(Context, 0);

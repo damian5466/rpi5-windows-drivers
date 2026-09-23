@@ -1,11 +1,15 @@
 # RP1 GPIO and pin control
 
-`Pi5Gpio.sys` is a GpioClx controller for RP1 bank zero. The 40-pin header
+`Pi5Gpio.sys` is a GpioClx controller for RP1. The 40-pin header
 exposes GPIO2–27; GPIO0/1 are reserved for HAT identification. Input, output,
 pulls and edge/level interrupts are implemented. GpioClx arbitrates ownership,
 emulates debounce/active-both, and handles function-config connections for the
 UART, I²C and SPI controllers. Touched pins return to their boot configuration
-when released. Board-internal banks are not mapped.
+when released. Version 0.3 adds output-only board pins 32/34/44/46 for the
+board-service driver. One 54-pin logical bank serializes the three hardware
+banks; all other internal pins and internal interrupts remain unavailable.
+GPIO45 remains owned by the fan driver. Established board outputs retain
+their drive during ownership and restoration, including Ethernet PHY reset.
 
 Use the desktop tool through the standard Windows GPIO API:
 
