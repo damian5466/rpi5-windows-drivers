@@ -1,0 +1,38 @@
+; SPDX-License-Identifier: BSD-2-Clause-Patent
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+DriverVer=09/23/2026,0.2.0.0
+CatalogFile=pi5spi.cat
+PnpLockdown=1
+[Manufacturer]
+%Provider%=Models,NTarm64.10.0
+[Models.NTarm64.10.0]
+%Device%=Install,ACPI\RPI0060
+[SourceDisksNames]
+1=%Device%,,,
+[SourceDisksFiles]
+Pi5Spi.sys=1
+[DestinationDirs]
+DriverCopy=13
+[Install.NT]
+CopyFiles=DriverCopy
+[DriverCopy]
+Pi5Spi.sys
+[Install.NT.Services]
+AddService=Pi5Spi,2,Service
+[Service]
+DisplayName=%Device%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\Pi5Spi.sys
+[Install.NT.Wdf]
+KmdfService=Pi5Spi,WdfSection
+[WdfSection]
+KmdfLibraryVersion=1.33
+[Strings]
+Provider="RPi5 UEFI project"
+Device="RP1 header SPI controller (experimental)"
