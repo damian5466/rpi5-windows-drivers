@@ -1,0 +1,35 @@
+; SPDX-License-Identifier: BSD-2-Clause-Patent
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+DriverVer=09/21/2026,0.1.0.2
+CatalogFile=pi5nvram.cat
+PnpLockdown=1
+[DefaultInstall.NTarm64]
+CopyFiles=DriverCopy
+[DefaultInstall.NTarm64.Services]
+AddService=Pi5Nvram,0,Service
+[DefaultInstall.NTarm64.Wdf]
+KmdfService=Pi5Nvram,WdfSection
+[WdfSection]
+KmdfLibraryVersion=1.33
+[Service]
+DisplayName=%ServiceName%
+ServiceType=1
+StartType=2
+ErrorControl=1
+ServiceBinary=%13%\Pi5Nvram.sys
+[SourceDisksNames]
+1=%Disk%,,,
+[SourceDisksFiles]
+Pi5Nvram.sys=1
+[DestinationDirs]
+DriverCopy=13
+[DriverCopy]
+Pi5Nvram.sys
+[Strings]
+Provider="RPi5 UEFI project"
+ServiceName="Pi 5 file-backed UEFI variable persistence"
+Disk="Pi 5 NVRAM test driver"

@@ -1,0 +1,14 @@
+Build/
+__pycache__/
+*.pyc
+*.sys
+*.cat
+*.pdb
+*.obj
+*.exe
+*.cer
+*.pfx
+*.p12
+*.fd
+RPI_NV?.bin
+.DS_Store

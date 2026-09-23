@@ -1,0 +1,56 @@
+; SPDX-License-Identifier: BSD-2-Clause-Patent
+[Version]
+Signature="$WINDOWS NT$"
+Class=Net
+ClassGuid={4d36e972-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+DriverVer=09/21/2026,0.1.0.3
+CatalogFile=pi5ethernet.cat
+PnpLockdown=1
+
+[Manufacturer]
+%Provider%=Models,NTarm64.10.0
+
+[Models.NTarm64.10.0]
+%Device%=Install,ACPI\RPI0001
+
+[SourceDisksNames]
+1=%Disk%,,,
+[SourceDisksFiles]
+Pi5Ethernet.sys=1
+[DestinationDirs]
+DriverCopy=13
+
+[Install.NT]
+Characteristics=0x4
+BusType=0
+CopyFiles=DriverCopy
+AddReg=NetworkReg
+
+[DriverCopy]
+Pi5Ethernet.sys
+
+[NetworkReg]
+HKR,Ndi,Service,0,"Pi5Ethernet"
+HKR,Ndi\Interfaces,UpperRange,0,"ndis5"
+HKR,Ndi\Interfaces,LowerRange,0,"ethernet"
+HKR,,*IfType,0x10001,6
+HKR,,*MediaType,0x10001,0
+HKR,,*PhysicalMediaType,0x10001,14
+HKR,,ProbeOnly,0x10001,0
+
+[Install.NT.Services]
+AddService=Pi5Ethernet,2,Service
+
+[Service]
+DisplayName=%Device%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\Pi5Ethernet.sys
+LoadOrderGroup=NDIS
+
+[Strings]
+Provider="RPi5 UEFI project"
+Device="RP1 Ethernet (experimental)"
+Disk="RP1 Ethernet test driver"
