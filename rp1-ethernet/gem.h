@@ -14,7 +14,10 @@
 #define GEM_RBQP      0x018u
 #define GEM_TBQP      0x01cu
 #define GEM_RSR       0x020u
+#define GEM_ISR       0x024u
+#define GEM_IER       0x028u
 #define GEM_IDR       0x02cu
+#define GEM_IMR       0x030u
 #define GEM_MAN       0x034u
 #define GEM_MID       0x0fcu
 #define GEM_DCFG1     0x280u
@@ -26,6 +29,12 @@
 #define GEM_MPE       (1u << 4)
 #define GEM_TSTART    (1u << 9)
 #define GEM_TX_GO     (1u << 3)
+#define GEM_IRQ_COR   (1u << 23) /* DCFG1: interrupt status clears on read */
+#define GEM_IRQ_RX    (1u << 1)
+#define GEM_IRQ_TX    (1u << 7)
+#define GEM_IRQ_OVERRUN (1u << 10)
+#define GEM_IRQ_FATAL ((7u << 4) | (1u << 11))
+#define GEM_IRQ_MASK  (GEM_IRQ_RX | GEM_IRQ_TX | GEM_IRQ_OVERRUN | GEM_IRQ_FATAL)
 #define GEM_RX_OWN    1u
 #define GEM_RX_WRAP   2u
 #define GEM_RX_SOF    (1u << 14)
@@ -69,5 +78,7 @@ void gem_configure(const GEM_IO *, uint32_t dma_address, const uint8_t mac[6]);
 /* The caller serializes these with transmit and descriptor access. */
 void gem_set_speed(const GEM_IO *, unsigned mbps);
 void gem_disable(const GEM_IO *);
+/* ISR read/ack must be serialized with the interrupt handler. */
+uint32_t gem_interrupt_status(const GEM_IO *, int clear_on_read);
 int gem_rx_length(uint32_t control);
 #endif

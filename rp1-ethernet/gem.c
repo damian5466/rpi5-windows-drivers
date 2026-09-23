@@ -146,8 +146,15 @@ void gem_init_rings(volatile void *memory, uint32_t dma)
 
 void gem_disable(const GEM_IO *io)
 {
-    io->write(io->context, GEM_NCR, GEM_MPE);
     io->write(io->context, GEM_IDR, UINT32_MAX);
+    io->write(io->context, GEM_NCR, GEM_MPE);
+}
+
+uint32_t gem_interrupt_status(const GEM_IO *io, int clear_on_read)
+{
+    uint32_t status = io->read(io->context, GEM_ISR);
+    if (!clear_on_read && status) io->write(io->context, GEM_ISR, status);
+    return status;
 }
 
 void gem_configure(const GEM_IO *io, uint32_t dma, const uint8_t mac[6])

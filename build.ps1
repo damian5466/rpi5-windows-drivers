@@ -129,7 +129,7 @@ foreach ($name in $names) {
     $work = Join-Path $Output ('.work\' + $name + '-' + [Guid]::NewGuid().ToString('N'))
     New-Item $work -ItemType Directory -Force | Out-Null
     Get-ChildItem $source -File | Where-Object { $_.Extension -in '.c','.cpp','.h','.inf' } | Copy-Item -Destination $work
-    if ($name -in 'rp1-service','rp1-clocks','rp1-gpio','rp1-uart','rp1-i2c','rp1-spi') {
+    if ($name -in 'rp1-service','rp1-clocks','rp1-gpio','rp1-uart','rp1-i2c','rp1-spi','rp1-ethernet') {
         Copy-Item (Join-Path $PSScriptRoot 'common\*.h') $work
     }
     if ($name -eq 'pi5-nvram') {

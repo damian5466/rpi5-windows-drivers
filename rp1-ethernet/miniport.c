@@ -3,6 +3,7 @@
 #include <ntifs.h>
 #include <ndis.h>
 #include "gem.h"
+#include "rp1-service.h"
 
 #define TAG 'E1PR'
 #define FILTERS (NDIS_PACKET_TYPE_DIRECTED | NDIS_PACKET_TYPE_MULTICAST | \
@@ -39,7 +40,8 @@ typedef struct RX_SLOT {
 } RX_SLOT;
 
 typedef struct ADAPTER {
-    NDIS_HANDLE handle, configuration, nblPool;
+    NDIS_HANDLE handle, configuration, nblPool, interrupt;
+    HANDLE interruptRoute;
     PUCHAR registers;
     PHYSICAL_ADDRESS mmioAddress, dmaAddress;
     PDMA_ADAPTER dmaAdapter;
@@ -47,11 +49,18 @@ typedef struct ADAPTER {
     GEM_IO io;
     KSPIN_LOCK lock;
     /* PASSIVE_LEVEL worker/lifecycle exclusion, separate from the send lock. */
-    KMUTEX pollMutex;
-    KEVENT wake;
+    KMUTEX lifecycleMutex;
+    KEVENT wake, dpcIdle;
     HANDLE thread;
     volatile LONG terminate, surpriseRemoved;
     BOOLEAN running, powered, fault, dmaTouched, retainDma, ownsHardware, probeOnly;
+    BOOLEAN dpcActive;
+    /* Only the ISR and NdisMSynchronizeWithInterruptEx callbacks access these. */
+    BOOLEAN irqRunning, irqDeferred, irqSuppressed, irqClearOnRead;
+    ULONG irqPending;
+    volatile LONG recoveryRequested;
+    volatile LONG64 interrupts, interruptDpcs, rxInterrupts, txInterrupts;
+    ULONG recoveries, lastRecovery;
     ULONG speed, packetFilter, lookahead, multicastCount;
     UCHAR permanent[6], address[6], multicast[MULTICAST_MAX][6];
     ULONG txHead, txTail, txCount, rxHead;
@@ -97,7 +106,16 @@ MINIPORT_CANCEL_SEND CancelSend;
 MINIPORT_DEVICE_PNP_EVENT_NOTIFY PnpEvent;
 MINIPORT_SHUTDOWN Shutdown;
 MINIPORT_CANCEL_OID_REQUEST CancelOid;
-static KSTART_ROUTINE PollThread;
+static KSTART_ROUTINE MaintenanceThread;
+static MINIPORT_ISR Interrupt;
+static MINIPORT_INTERRUPT_DPC InterruptDpc;
+static MINIPORT_DISABLE_INTERRUPT DisableInterrupt;
+static MINIPORT_ENABLE_INTERRUPT EnableInterrupt;
+static MINIPORT_SYNCHRONIZE_INTERRUPT StopInterrupts;
+static MINIPORT_SYNCHRONIZE_INTERRUPT StartInterrupts;
+static MINIPORT_SYNCHRONIZE_INTERRUPT RearmInterrupts;
+static MINIPORT_SYNCHRONIZE_INTERRUPT TakeInterrupts;
+static MINIPORT_SYNCHRONIZE_INTERRUPT RemoveInterrupts;
 
 static uint32_t ReadRegister(void *context, uint32_t offset)
 {
@@ -127,10 +145,130 @@ static void DelayUs(void *context, unsigned us)
     }
 }
 
-static void LockPoll(ADAPTER *a)
-{ KeWaitForSingleObject(&a->pollMutex, Executive, KernelMode, FALSE, NULL); }
-static void UnlockPoll(ADAPTER *a)
-{ KeReleaseMutex(&a->pollMutex, FALSE); }
+static void LockLifecycle(ADAPTER *a)
+{ KeWaitForSingleObject(&a->lifecycleMutex, Executive, KernelMode, FALSE, NULL); }
+static void UnlockLifecycle(ADAPTER *a)
+{ KeReleaseMutex(&a->lifecycleMutex, FALSE); }
+
+/* The per-file lease is held until halt. The provider owns RP1's router;
+   this miniport maps only GEM and never writes USB or PCIe routing registers. */
+_IRQL_requires_(PASSIVE_LEVEL)
+static NTSTATUS OpenInterruptRoute(ADAPTER *a)
+{
+    UNICODE_STRING name = RTL_CONSTANT_STRING(RP1_SERVICE_NAME);
+    OBJECT_ATTRIBUTES attributes;
+    IO_STATUS_BLOCK iosb;
+    RP1_IRQ_REQUEST request = { RP1_SERVICE_VERSION, 6 };
+    NTSTATUS status;
+    InitializeObjectAttributes(&attributes, &name,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    status = ZwCreateFile(&a->interruptRoute, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+        &attributes, &iosb, NULL, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+    if (!NT_SUCCESS(status)) { a->interruptRoute = NULL; return status; }
+    status = ZwDeviceIoControlFile(a->interruptRoute, NULL, NULL, NULL, &iosb,
+        IOCTL_RP1_ACQUIRE_IRQ, &request, sizeof(request), NULL, 0);
+    if (status == STATUS_PENDING) {
+        ZwWaitForSingleObject(a->interruptRoute, FALSE, NULL);
+        status = iosb.Status;
+    }
+    if (!NT_SUCCESS(status)) { ZwClose(a->interruptRoute); a->interruptRoute = NULL; }
+    return status;
+}
+
+/* DIRQL: never take the send lock, wait, indicate packets, or do MDIO here. */
+_Use_decl_annotations_
+static BOOLEAN StopInterrupts(PVOID context)
+{
+    ADAPTER *a = context;
+    a->irqRunning = FALSE;
+    a->irqDeferred = FALSE;
+    a->irqPending = 0;
+    if (!a->surpriseRemoved) WriteRegister(a, GEM_IDR, UINT32_MAX);
+    return TRUE;
+}
+
+_Use_decl_annotations_
+static BOOLEAN StartInterrupts(PVOID context)
+{
+    ADAPTER *a = context;
+    a->irqPending = 0;
+    a->irqDeferred = FALSE;
+    /* Clear stale status before enabling DMA, so a first packet cannot be lost. */
+    (void)gem_interrupt_status(&a->io, a->irqClearOnRead);
+    a->irqRunning = TRUE;
+    if (!a->irqSuppressed) WriteRegister(a, GEM_IER, GEM_IRQ_MASK);
+    return TRUE;
+}
+
+_Use_decl_annotations_
+static BOOLEAN RearmInterrupts(PVOID context)
+{
+    ADAPTER *a = context;
+    a->irqDeferred = FALSE;
+    /* Do not acknowledge here: events arriving while masked must retrigger. */
+    if (a->irqRunning && !a->irqSuppressed && !a->surpriseRemoved)
+        WriteRegister(a, GEM_IER, GEM_IRQ_MASK);
+    return TRUE;
+}
+
+typedef struct INTERRUPT_STATUS { ADAPTER *adapter; ULONG status; } INTERRUPT_STATUS;
+_Use_decl_annotations_
+static BOOLEAN TakeInterrupts(PVOID context)
+{
+    INTERRUPT_STATUS *s = context;
+    s->status = s->adapter->irqPending;
+    s->adapter->irqPending = 0;
+    if (s->adapter->irqRunning && !s->adapter->surpriseRemoved)
+        s->status |= gem_interrupt_status(&s->adapter->io, s->adapter->irqClearOnRead) & GEM_IRQ_MASK;
+    return TRUE;
+}
+
+_Use_decl_annotations_
+static BOOLEAN RemoveInterrupts(PVOID context)
+{
+    ADAPTER *a = context;
+    a->irqRunning = FALSE;
+    InterlockedExchange(&a->surpriseRemoved, 1);
+    return TRUE; /* The disappeared device must not be accessed. */
+}
+
+_Use_decl_annotations_
+static VOID DisableInterrupt(NDIS_HANDLE context)
+{
+    ADAPTER *a = context;
+    a->irqSuppressed = TRUE;
+    if (!a->surpriseRemoved) WriteRegister(a, GEM_IDR, UINT32_MAX);
+}
+
+_Use_decl_annotations_
+static VOID EnableInterrupt(NDIS_HANDLE context)
+{
+    ADAPTER *a = context;
+    a->irqSuppressed = FALSE;
+    if (a->irqRunning && !a->irqDeferred && !a->surpriseRemoved)
+        WriteRegister(a, GEM_IER, GEM_IRQ_MASK);
+}
+
+_Use_decl_annotations_
+static BOOLEAN Interrupt(NDIS_HANDLE context, PBOOLEAN queueDpc, PULONG targetProcessors)
+{
+    ADAPTER *a = context;
+    ULONG status;
+    *queueDpc = FALSE;
+    *targetProcessors = 0;
+    if (!a->irqRunning || a->irqDeferred || a->irqSuppressed || a->surpriseRemoved) return FALSE;
+    status = gem_interrupt_status(&a->io, a->irqClearOnRead) & GEM_IRQ_MASK;
+    if (!status) return FALSE; /* Shared GIC line: this interrupt belongs to another client. */
+    WriteRegister(a, GEM_IDR, GEM_IRQ_MASK);
+    a->irqDeferred = TRUE;
+    a->irqPending |= status;
+    InterlockedIncrement64(&a->interrupts);
+    if (status & GEM_IRQ_RX) InterlockedIncrement64(&a->rxInterrupts);
+    if (status & GEM_IRQ_TX) InterlockedIncrement64(&a->txInterrupts);
+    *queueDpc = TRUE;
+    return TRUE;
+}
 
 static void Diagnostic(ADAPTER *a, PCWSTR name, ULONG value)
 {
@@ -224,7 +362,7 @@ static void IndicateLink(ADAPTER *a)
 }
 
 /* Stop submission first, then stop DMA before returning any pending sends.
-   pollMutex is held. A stuck DMA engine's common buffer is retained at halt. */
+   lifecycleMutex is held. A stuck DMA engine's common buffer is retained at halt. */
 static PNET_BUFFER_LIST StopHardware(ADAPTER *a, NDIS_STATUS status)
 {
     KIRQL irql;
@@ -233,8 +371,13 @@ static PNET_BUFFER_LIST StopHardware(ADAPTER *a, NDIS_STATUS status)
     KeAcquireSpinLock(&a->lock, &irql);
     a->running = FALSE;
     a->speed = 0;
+    InterlockedExchange(&a->recoveryRequested, 0);
+    if (a->interrupt) NdisMSynchronizeWithInterruptEx(a->interrupt, 0, StopInterrupts, a);
     if (a->registers && !a->surpriseRemoved) gem_disable(&a->io);
     KeReleaseSpinLock(&a->lock, irql);
+    /* A DPC owns its receive NBLs until the synchronous indication returns.
+       Queued DPCs observe running=FALSE; active DPCs signal only after completion. */
+    KeWaitForSingleObject(&a->dpcIdle, Executive, KernelMode, FALSE, NULL);
     if (a->dmaTouched && !a->surpriseRemoved) {
         for (i = 0; i < 1000; ++i) {
             if (!(ReadRegister(a, GEM_TSR) & GEM_TX_GO)) break;
@@ -262,7 +405,7 @@ static PNET_BUFFER_LIST StopHardware(ADAPTER *a, NDIS_STATUS status)
 static void Complete(ADAPTER *a, PNET_BUFFER_LIST lists, ULONG flags)
 { if (lists) NdisMSendNetBufferListsComplete(a->handle, lists, flags); }
 
-/* pollMutex held; callers have already drained all pending descriptors. */
+/* lifecycleMutex held; callers have already drained all pending descriptors/DPCs. */
 static void StartHardware(ADAPTER *a, ULONG speed)
 {
     KIRQL irql;
@@ -272,16 +415,17 @@ static void StartHardware(ADAPTER *a, ULONG speed)
     gem_set_speed(&a->io, speed);
     a->rxHead = 0;
     KeAcquireSpinLock(&a->lock, &irql);
-    if (speed) {
-        a->dmaTouched = TRUE;
-        WriteRegister(a, GEM_NCR, GEM_MPE | GEM_RE | GEM_TE);
-    }
     a->speed = speed;
     a->running = TRUE;
+    if (speed) {
+        a->dmaTouched = TRUE;
+        NdisMSynchronizeWithInterruptEx(a->interrupt, 0, StartInterrupts, a);
+        WriteRegister(a, GEM_NCR, GEM_MPE | GEM_RE | GEM_TE);
+    }
     KeReleaseSpinLock(&a->lock, irql);
 }
 
-static void PollErrors(ADAPTER *a)
+static void AccumulateErrors(ADAPTER *a)
 {
     KIRQL irql;
     ULONG resource, overrun, alignment;
@@ -307,21 +451,25 @@ static void PollErrors(ADAPTER *a)
     KeReleaseSpinLock(&a->lock, irql);
 }
 
-static void PollTransmit(ADAPTER *a)
+static void CompleteTransmit(ADAPTER *a)
 {
     PNET_BUFFER_LIST completed = NULL;
     GEM_DESC *ring = (GEM_DESC *)(a->dma + GEM_TX_DESC_OFFSET);
     KIRQL irql;
-    BOOLEAN timeout = FALSE;
     KeAcquireSpinLock(&a->lock, &irql);
-    while (a->txCount) {
+    while (a->running && a->txCount) {
         ULONG control = ring[a->txTail].control;
         TX_SLOT *slot = &a->tx[a->txTail];
-        if (!(control & GEM_TX_USED)) {
-            timeout = KeQueryInterruptTime() - slot->started > 50000000;
+        if (!(control & GEM_TX_USED)) break;
+        KeMemoryBarrier();
+        if (!slot->nbl) {
+            /* A published descriptor must retain its NBL until completion. */
+            a->running = FALSE;
+            NdisMSynchronizeWithInterruptEx(a->interrupt, 0, StopInterrupts, a);
+            InterlockedOr(&a->recoveryRequested, 0x40000000);
+            KeSetEvent(&a->wake, IO_NO_INCREMENT, FALSE);
             break;
         }
-        KeMemoryBarrier();
         if (control & GEM_TX_ERRORS) {
             NET_BUFFER_LIST_STATUS(slot->nbl) = NDIS_STATUS_FAILURE;
             a->txErrors++;
@@ -339,22 +487,15 @@ static void PollTransmit(ADAPTER *a)
         a->txCount--;
     }
     KeReleaseSpinLock(&a->lock, irql);
-    Complete(a, completed, 0);
-    if (timeout) {
-        a->fault = TRUE;
-        completed = StopHardware(a, NDIS_STATUS_FAILURE);
-        Snapshot(a, 90);
-        Complete(a, completed, 0);
-        IndicateLink(a);
-    }
+    Complete(a, completed, NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL);
 }
 
-static ULONG PollReceive(ADAPTER *a)
+static ULONG Receive(ADAPTER *a, ULONG limit)
 {
     GEM_DESC *ring = (GEM_DESC *)(a->dma + GEM_RX_DESC_OFFSET);
     PNET_BUFFER_LIST first = NULL, last = NULL;
     ULONG n, indicated = 0;
-    for (n = 0; n < RX_BATCH_SIZE; ++n) {
+    for (n = 0; n < RX_BATCH_SIZE && indicated < limit; ++n) {
         RX_SLOT *receive = &a->rx[indicated];
         KIRQL irql;
         ULONG address, slot, kind;
@@ -396,56 +537,129 @@ static ULONG PollReceive(ADAPTER *a)
     /* Recycle DMA descriptors before entering the stack. RESOURCES keeps
        ownership synchronous, so pause/halt cannot race outstanding receives. */
     if (first) NdisMIndicateReceiveNetBufferLists(a->handle, first, 0, indicated,
-                                                NDIS_RECEIVE_FLAGS_RESOURCES);
-    return n;
+        NDIS_RECEIVE_FLAGS_RESOURCES | NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL);
+    return indicated;
 }
 
 _Use_decl_annotations_
-static void PollThread(PVOID context)
+static VOID InterruptDpc(NDIS_HANDLE context, PVOID dpcContext, PVOID throttleContext, PVOID reserved)
+{
+    ADAPTER *a = context;
+    PNDIS_RECEIVE_THROTTLE_PARAMETERS throttle = throttleContext;
+    INTERRUPT_STATUS pending = { a, 0 };
+    GROUP_AFFINITY target = {0};
+    PROCESSOR_NUMBER processor;
+    KIRQL irql;
+    ULONG received, limit = throttle->MaxNblsToIndicate;
+    BOOLEAN moreRx, moreTx;
+    GEM_DESC *rx = (GEM_DESC *)(a->dma + GEM_RX_DESC_OFFSET);
+    GEM_DESC *tx = (GEM_DESC *)(a->dma + GEM_TX_DESC_OFFSET);
+    UNREFERENCED_PARAMETER(dpcContext);
+    UNREFERENCED_PARAMETER(reserved);
+    throttle->MoreNblsPending = FALSE;
+    KeAcquireSpinLock(&a->lock, &irql);
+    if (!a->running || !a->speed || a->surpriseRemoved || a->dpcActive) {
+        KeReleaseSpinLock(&a->lock, irql);
+        return;
+    }
+    a->dpcActive = TRUE;
+    KeClearEvent(&a->dpcIdle);
+    NdisMSynchronizeWithInterruptEx(a->interrupt, 0, TakeInterrupts, &pending);
+    InterlockedIncrement64(&a->interruptDpcs);
+    if (pending.status & GEM_IRQ_FATAL) {
+        a->running = FALSE;
+        NdisMSynchronizeWithInterruptEx(a->interrupt, 0, StopInterrupts, a);
+        InterlockedOr(&a->recoveryRequested, (LONG)(pending.status & GEM_IRQ_FATAL));
+        KeSetEvent(&a->wake, IO_NO_INCREMENT, FALSE);
+    }
+    KeReleaseSpinLock(&a->lock, irql);
+
+    CompleteTransmit(a);
+    received = Receive(a, limit);
+
+    KeAcquireSpinLock(&a->lock, &irql);
+    if (a->running && !a->surpriseRemoved) {
+        /* Check ownership after processing, not just the ISR's snapshot. Events
+           remain latched while masked, closing the final drain/rearm race. */
+        KeMemoryBarrier();
+        moreRx = !!(rx[a->rxHead].address & GEM_RX_OWN);
+        moreTx = a->txCount && !!(tx[a->txTail].control & GEM_TX_USED);
+        if (moreRx && limit != NDIS_INDICATE_ALL_NBLS && received == limit) {
+            throttle->MoreNblsPending = TRUE; /* NDIS schedules the continuation. */
+        } else if (moreRx || moreTx) {
+            /* Stay masked and yield after at most 64 RX descriptors. Queue on
+               this CPU so this continuation cannot run before we return. */
+            KeGetCurrentProcessorNumberEx(&processor);
+            target.Group = processor.Group;
+            target.Mask = (KAFFINITY)1 << processor.Number;
+            (void)NdisMQueueDpcEx(a->interrupt, 0, &target, NULL);
+        } else NdisMSynchronizeWithInterruptEx(a->interrupt, 0, RearmInterrupts, a);
+    }
+    a->dpcActive = FALSE;
+    KeSetEvent(&a->dpcIdle, IO_NO_INCREMENT, FALSE);
+    KeReleaseSpinLock(&a->lock, irql);
+}
+
+_Use_decl_annotations_
+static void MaintenanceThread(PVOID context)
 {
     ADAPTER *a = context;
     LARGE_INTEGER interval;
-    ULONGLONG nextLink = 0, nextStatistics = 0, nextErrors = 0;
-    ULONG received = 0;
-    interval.QuadPart = -20000; /* 2ms requested; normal scheduler granularity applies. */
+    ULONGLONG nextStatistics = 0;
+    interval.QuadPart = -10000000; /* PHY/health only; never services packet rings. */
     while (!a->terminate) {
-        /* Drain active traffic in bounded batches without a sleep between
-           batches. Release pollMutex every pass for pause/power/halt fairness. */
-        if (!received) KeWaitForSingleObject(&a->wake, Executive, KernelMode, FALSE, &interval);
+        ULONG recovery;
+        KIRQL irql;
+        KeWaitForSingleObject(&a->wake, Executive, KernelMode, FALSE, &interval);
         if (a->terminate) break;
-        received = 0;
-        LockPoll(a);
+        LockLifecycle(a);
+        recovery = (ULONG)InterlockedExchange(&a->recoveryRequested, 0);
+        KeAcquireSpinLock(&a->lock, &irql);
+        if (a->running && a->txCount &&
+            KeQueryInterruptTime() - a->tx[a->txTail].started > 50000000)
+            recovery |= 0x80000000u; /* Hung TX: fail and reset, never poll-complete. */
+        KeReleaseSpinLock(&a->lock, irql);
+        if (recovery && a->powered && !a->surpriseRemoved && !a->probeOnly) {
+            ULONG speed = a->speed;
+            PNET_BUFFER_LIST cancelled = StopHardware(a, NDIS_STATUS_FAILURE);
+            a->recoveries++;
+            a->lastRecovery = recovery;
+            Complete(a, cancelled, 0);
+            if (!a->fault) StartHardware(a, speed);
+            Snapshot(a, 90);
+            IndicateLink(a);
+        }
         if (a->running && !a->surpriseRemoved) {
-            if (KeQueryInterruptTime() >= nextLink) {
-                int speed = gem_link(&a->io);
-                if (speed < 0) speed = 0;
-                if (a->speed != (ULONG)speed) {
-                    PNET_BUFFER_LIST cancelled = StopHardware(a, NDIS_STATUS_MEDIA_DISCONNECTED);
-                    Complete(a, cancelled, 0);
-                    /* Speed bits change only with MAC RX/TX disabled. */
-                    if (!a->fault) StartHardware(a, (ULONG)speed);
-                    IndicateLink(a);
-                    Diagnostic(a, L"DiagLinkMbps", a->speed);
-                }
-                nextLink = KeQueryInterruptTime() + 10000000;
+            int speed = gem_link(&a->io);
+            if (speed < 0) speed = 0;
+            if (a->speed != (ULONG)speed) {
+                PNET_BUFFER_LIST cancelled = StopHardware(a, NDIS_STATUS_MEDIA_DISCONNECTED);
+                Complete(a, cancelled, 0);
+                /* Speed bits change only with MAC RX/TX disabled. */
+                if (!a->fault) StartHardware(a, (ULONG)speed);
+                IndicateLink(a);
+                Diagnostic(a, L"DiagLinkMbps", a->speed);
             }
-            PollTransmit(a);
-            received = PollReceive(a);
-            if (KeQueryInterruptTime() >= nextErrors) {
-                PollErrors(a);
-                nextErrors = KeQueryInterruptTime() + 1000000;
-            }
+            AccumulateErrors(a);
             if (KeQueryInterruptTime() >= nextStatistics) {
-                /* Only this worker increments these counters. Diagnostic writes
-                   must remain at PASSIVE_LEVEL, outside the send spin lock. */
+                ULONGLONG filtered;
+                KeAcquireSpinLock(&a->lock, &irql);
+                filtered = a->rxFiltered;
+                KeReleaseSpinLock(&a->lock, irql);
                 Diagnostic(a, L"DiagRxResourceLow", (ULONG)a->rxResource);
                 Diagnostic(a, L"DiagRxOverrunLow", (ULONG)a->rxOverrun);
-                Diagnostic(a, L"DiagRxFilteredLow", (ULONG)a->rxFiltered);
+                Diagnostic(a, L"DiagRxFilteredLow", (ULONG)filtered);
+                Diagnostic(a, L"DiagInterrupts", (ULONG)InterlockedCompareExchange64(&a->interrupts, 0, 0));
+                Diagnostic(a, L"DiagInterruptDpcs", (ULONG)InterlockedCompareExchange64(&a->interruptDpcs, 0, 0));
+                Diagnostic(a, L"DiagRxInterrupts", (ULONG)InterlockedCompareExchange64(&a->rxInterrupts, 0, 0));
+                Diagnostic(a, L"DiagTxInterrupts", (ULONG)InterlockedCompareExchange64(&a->txInterrupts, 0, 0));
+                Diagnostic(a, L"DiagRecoveries", a->recoveries);
+                Diagnostic(a, L"DiagLastRecovery", a->lastRecovery);
                 Diagnostic(a, L"DiagStatisticsUptimeSeconds", (ULONG)(KeQueryInterruptTime() / 10000000));
                 nextStatistics = KeQueryInterruptTime() + 100000000;
             }
         }
-        UnlockPoll(a);
+        UnlockLifecycle(a);
     }
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -520,7 +734,6 @@ VOID Send(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, UL
     }
     KeReleaseSpinLock(&a->lock, irql);
     Complete(a, completed, completionFlags);
-    KeSetEvent(&a->wake, IO_NO_INCREMENT, FALSE);
 }
 
 _Use_decl_annotations_
@@ -551,9 +764,9 @@ NDIS_STATUS Pause(NDIS_HANDLE context, PNDIS_MINIPORT_PAUSE_PARAMETERS parameter
     ADAPTER *a = context;
     PNET_BUFFER_LIST completed;
     UNREFERENCED_PARAMETER(parameters);
-    LockPoll(a);
+    LockLifecycle(a);
     completed = StopHardware(a, NDIS_STATUS_PAUSED);
-    UnlockPoll(a);
+    UnlockLifecycle(a);
     Complete(a, completed, 0);
     return NDIS_STATUS_SUCCESS;
 }
@@ -563,18 +776,18 @@ NDIS_STATUS Restart(NDIS_HANDLE context, PNDIS_MINIPORT_RESTART_PARAMETERS param
 {
     ADAPTER *a = context;
     UNREFERENCED_PARAMETER(parameters);
-    LockPoll(a);
+    LockLifecycle(a);
     if (a->fault || a->surpriseRemoved || !a->powered) {
-        UnlockPoll(a); return NDIS_STATUS_HARD_ERRORS;
+        UnlockLifecycle(a); return NDIS_STATUS_HARD_ERRORS;
     }
     if (a->probeOnly) {
         Snapshot(a, 65);
-        UnlockPoll(a);
+        UnlockLifecycle(a);
         return NDIS_STATUS_SUCCESS;
     }
     StartHardware(a, 0); /* wait for successful PHY negotiation before DMA */
     Snapshot(a, 70);
-    UnlockPoll(a);
+    UnlockLifecycle(a);
     KeSetEvent(&a->wake, IO_NO_INCREMENT, FALSE);
     return NDIS_STATUS_SUCCESS;
 }
@@ -593,6 +806,10 @@ static void Cleanup(_In_ __drv_freesMem(Mem)
     }
     if (a->dmaTouched) Complete(a, StopHardware(a, NDIS_STATUS_CLOSING), 0);
     else if (a->ownsHardware && !a->surpriseRemoved) gem_disable(&a->io);
+    /* Disconnect waits for every queued ISR/DPC before any NBL, DMA or MMIO
+       storage is freed. Release the provider lease only after GEM is masked. */
+    if (a->interrupt) { NdisMDeregisterInterruptEx(a->interrupt); a->interrupt = NULL; }
+    if (a->interruptRoute) { ZwClose(a->interruptRoute); a->interruptRoute = NULL; }
     for (i = 0; i < RX_BATCH_SIZE; ++i) {
         PNET_BUFFER_LIST nbl = a->rx[i].nbl;
         PMDL mdl = a->rx[i].mdl;
@@ -620,8 +837,20 @@ _Use_decl_annotations_
 VOID Shutdown(NDIS_HANDLE context, NDIS_SHUTDOWN_ACTION action)
 {
     ADAPTER *a = context;
-    UNREFERENCED_PARAMETER(action);
-    /* May run at HIGH_LEVEL during a bugcheck: no waits or allocations. */
+    if (action == NdisShutdownPowerOff && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        PNET_BUFFER_LIST completed;
+        /* The maintenance thread is ours, so NDIS cannot stop it for us. */
+        InterlockedExchange(&a->terminate, 1);
+        KeSetEvent(&a->wake, IO_NO_INCREMENT, FALSE);
+        LockLifecycle(a);
+        completed = StopHardware(a, NDIS_STATUS_CLOSING);
+        UnlockLifecycle(a);
+        Complete(a, completed, 0);
+        return;
+    }
+    /* Bugcheck path: no waits, locks or allocations. */
+    a->irqRunning = FALSE;
+    KeMemoryBarrier();
     if (a->ownsHardware && !a->surpriseRemoved) gem_disable(&a->io);
 }
 
@@ -631,14 +860,16 @@ VOID PnpEvent(NDIS_HANDLE context, PNET_DEVICE_PNP_EVENT event)
     ADAPTER *a = context;
     if (event->DevicePnPEvent == NdisDevicePnPEventSurpriseRemoved) {
         KIRQL irql;
-        LockPoll(a);
+        LockLifecycle(a);
         KeAcquireSpinLock(&a->lock, &irql);
-        InterlockedExchange(&a->surpriseRemoved, 1);
+        if (a->interrupt) NdisMSynchronizeWithInterruptEx(a->interrupt, 0, RemoveInterrupts, a);
+        else InterlockedExchange(&a->surpriseRemoved, 1);
         /* RP1 is soldered on; loss of the PCIe parent forbids further MMIO. */
         a->retainDma = TRUE;
         a->running = FALSE;
         KeReleaseSpinLock(&a->lock, irql);
-        UnlockPoll(a);
+        KeWaitForSingleObject(&a->dpcIdle, Executive, KernelMode, FALSE, NULL);
+        UnlockLifecycle(a);
     }
 }
 
@@ -689,7 +920,7 @@ NDIS_STATUS OidRequest(NDIS_HANDLE context, PNDIS_OID_REQUEST request)
     NDIS_PNP_CAPABILITIES power = {0};
     NDIS_INTERRUPT_MODERATION_PARAMETERS moderation = {0};
     NDIS_LINK_PARAMETERS link = {0};
-    static const char vendor[] = "RP1 Ethernet experimental polling miniport";
+    static const char vendor[] = "RP1 Ethernet interrupt-driven miniport";
     BOOLEAN set = request->RequestType == NdisRequestSetInformation;
     if (!set && request->RequestType != NdisRequestQueryInformation &&
         request->RequestType != NdisRequestQueryStatistics) return NDIS_STATUS_NOT_SUPPORTED;
@@ -707,7 +938,7 @@ NDIS_STATUS OidRequest(NDIS_HANDLE context, PNDIS_OID_REQUEST request)
     KeAcquireSpinLock(&a->lock, &irql);
     if (set) {
         if (oid == OID_GEN_INTERRUPT_MODERATION) {
-            status = NDIS_STATUS_INVALID_DATA; /* hardware interrupts are disabled */
+            status = NDIS_STATUS_INVALID_DATA; /* no configurable hardware moderation */
         } else if (oid == OID_GEN_LINK_PARAMETERS) {
             size = NDIS_SIZEOF_LINK_PARAMETERS_REVISION_1;
             if (length < size) status = NDIS_STATUS_INVALID_LENGTH;
@@ -763,7 +994,7 @@ NDIS_STATUS OidRequest(NDIS_HANDLE context, PNDIS_OID_REQUEST request)
         case OID_GEN_CURRENT_PACKET_FILTER: value = a->packetFilter; break;
         case OID_GEN_CURRENT_LOOKAHEAD: value = a->lookahead; break;
         case OID_GEN_DRIVER_VERSION: result = &version; size = sizeof(version); break;
-        case OID_GEN_VENDOR_DRIVER_VERSION: value = 0x00010003; break;
+        case OID_GEN_VENDOR_DRIVER_VERSION: value = 0x00030000; break;
         case OID_GEN_MAC_OPTIONS: value = NDIS_MAC_OPTION_COPY_LOOKAHEAD_DATA | NDIS_MAC_OPTION_TRANSFERS_NOT_PEND | NDIS_MAC_OPTION_NO_LOOPBACK; break;
         case OID_GEN_MEDIA_CONNECT_STATUS: value = a->speed ? NdisMediaStateConnected : NdisMediaStateDisconnected; break;
         case OID_GEN_MAXIMUM_SEND_PACKETS: value = GEM_RING_SIZE - 1; break;
@@ -817,13 +1048,14 @@ NDIS_STATUS Initialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     NDIS_STATUS status = NDIS_STATUS_RESOURCES;
     NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES registration = {0};
     NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES general = {0};
+    NDIS_MINIPORT_INTERRUPT_CHARACTERISTICS interrupt = {0};
     NDIS_CONFIGURATION_OBJECT configuration = {0};
     NET_BUFFER_LIST_POOL_PARAMETERS pool = {0};
     NDIS_PM_CAPABILITIES power = {0};
     DEVICE_DESCRIPTION description = {0};
     PDEVICE_OBJECT pdo;
     OBJECT_ATTRIBUTES threadAttributes;
-    ULONG i, mapRegisters, low, high, phy;
+    ULONG i, mapRegisters, low, high, phy, interruptCount = 0;
     UINT addressLength = 0;
     PVOID networkAddress = NULL;
     PNDIS_CONFIGURATION_PARAMETER option;
@@ -840,8 +1072,9 @@ NDIS_STATUS Initialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     a->io.context = a; a->io.read = ReadRegister; a->io.write = WriteRegister;
     a->io.delay_us = DelayUs; a->io.barrier = Barrier;
     KeInitializeSpinLock(&a->lock);
-    KeInitializeMutex(&a->pollMutex, 0);
+    KeInitializeMutex(&a->lifecycleMutex, 0);
     KeInitializeEvent(&a->wake, SynchronizationEvent, FALSE);
+    KeInitializeEvent(&a->dpcIdle, NotificationEvent, TRUE);
     registration.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES;
     registration.Header.Revision = NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_1;
     registration.Header.Size = NDIS_SIZEOF_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_1;
@@ -863,13 +1096,20 @@ NDIS_STATUS Initialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     if (!parameters->AllocatedResources) goto failed;
     for (i = 0; i < parameters->AllocatedResources->Count; ++i) {
         PCM_PARTIAL_RESOURCE_DESCRIPTOR r = &parameters->AllocatedResources->PartialDescriptors[i];
+        if (r->Type == CmResourceTypeInterrupt) {
+            if ((r->Flags & (CM_RESOURCE_INTERRUPT_MESSAGE | CM_RESOURCE_INTERRUPT_LATCHED)) ||
+                r->ShareDisposition != CmResourceShareShared) {
+                status = NDIS_STATUS_RESOURCE_CONFLICT; goto failed;
+            }
+            ++interruptCount;
+        }
         if (r->Type != CmResourceTypeMemory || r->u.Memory.Length != 0x4000) continue;
         if (a->registers) { status = NDIS_STATUS_RESOURCE_CONFLICT; goto failed; }
         a->mmioAddress = r->u.Memory.Start;
         status = NdisMMapIoSpace((PVOID *)&a->registers, handle, a->mmioAddress, 0x4000);
         if (status != NDIS_STATUS_SUCCESS) goto failed;
     }
-    if (!a->registers) goto failed;
+    if (!a->registers || interruptCount != 1) { status = NDIS_STATUS_RESOURCE_CONFLICT; goto failed; }
     Diagnostic(a, L"DiagMmioLow", a->mmioAddress.LowPart);
     Diagnostic(a, L"DiagMmioHigh", (ULONG)a->mmioAddress.HighPart);
     Snapshot(a, 20);
@@ -878,6 +1118,8 @@ NDIS_STATUS Initialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     /* Never take over an already active DMA engine. */
     if (ReadRegister(a, GEM_NCR) & (GEM_RE | GEM_TE)) goto failed;
     a->ownsHardware = TRUE;
+    gem_disable(&a->io);
+    a->irqClearOnRead = !!(ReadRegister(a, GEM_DCFG1) & GEM_IRQ_COR);
     WriteRegister(a, GEM_NCR, GEM_MPE | (1u << 5)); /* reset statistics */
     WriteRegister(a, GEM_NCFGR, (ReadRegister(a, GEM_NCFGR) & ~(7u << 18)) | (5u << 18));
     WriteRegister(a, GEM_NCR, GEM_MPE);
@@ -963,8 +1205,27 @@ NDIS_STATUS Initialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     general.PowerManagementCapabilitiesEx = &power;
     status = NdisMSetMiniportAttributes(handle, (PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&general);
     if (status != NDIS_STATUS_SUCCESS) goto failed;
+    if (!a->probeOnly) {
+        interrupt.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_INTERRUPT;
+        interrupt.Header.Revision = NDIS_MINIPORT_INTERRUPT_REVISION_1;
+        interrupt.Header.Size = NDIS_SIZEOF_MINIPORT_INTERRUPT_CHARACTERISTICS_REVISION_1;
+        interrupt.InterruptHandler = Interrupt;
+        interrupt.InterruptDpcHandler = InterruptDpc;
+        interrupt.DisableInterruptHandler = DisableInterrupt;
+        interrupt.EnableInterruptHandler = EnableInterrupt;
+        status = NdisMRegisterInterruptEx(handle, a, &interrupt, &a->interrupt);
+        if (status != NDIS_STATUS_SUCCESS) goto failed;
+        if (interrupt.InterruptType != NDIS_CONNECT_LINE_BASED) {
+            status = NDIS_STATUS_RESOURCE_CONFLICT; goto failed;
+        }
+        ntstatus = OpenInterruptRoute(a);
+        Diagnostic(a, L"DiagInterruptRouteStatus", (ULONG)ntstatus);
+        if (!NT_SUCCESS(ntstatus)) { status = (NDIS_STATUS)ntstatus; goto failed; }
+        Diagnostic(a, L"DiagInterruptMode", 1);
+        Diagnostic(a, L"DiagInterruptClearOnRead", a->irqClearOnRead);
+    }
     InitializeObjectAttributes(&threadAttributes, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
-    ntstatus = PsCreateSystemThread(&a->thread, THREAD_ALL_ACCESS, &threadAttributes, NULL, NULL, PollThread, a);
+    ntstatus = PsCreateSystemThread(&a->thread, THREAD_ALL_ACCESS, &threadAttributes, NULL, NULL, MaintenanceThread, a);
     if (!NT_SUCCESS(ntstatus)) { status = NDIS_STATUS_RESOURCES; goto failed; }
     Snapshot(a, 60);
     Diagnostic(a, L"DiagStatus", NDIS_STATUS_SUCCESS);
@@ -990,7 +1251,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING path)
     c.Header.Revision = NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2;
     c.Header.Size = NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2;
     c.MajorNdisVersion = 6; c.MinorNdisVersion = 30;
-    c.MajorDriverVersion = 0; c.MinorDriverVersion = 1;
+    c.MajorDriverVersion = 0; c.MinorDriverVersion = 3;
     c.InitializeHandlerEx = Initialize; c.HaltHandlerEx = Halt; c.UnloadHandler = Unload;
     c.PauseHandler = Pause; c.RestartHandler = Restart; c.OidRequestHandler = OidRequest;
     c.SendNetBufferListsHandler = Send; c.ReturnNetBufferListsHandler = Return;
