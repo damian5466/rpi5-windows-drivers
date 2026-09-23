@@ -1,7 +1,8 @@
 # Raspberry Pi 5 Windows ARM64 drivers
 
-Experimental drivers for RP1 Ethernet and fan control, BCM2712 temperature/RNG,
-and file-backed UEFI variable persistence, plus a reproducible stock NVMe patch.
+Experimental drivers for the RP1 40-pin header, Ethernet and fan control,
+BCM2712 temperature/RNG, and file-backed UEFI variable persistence, plus a
+reproducible stock NVMe patch.
 Use these drivers with the matching [rpi5-uefi firmware](https://github.com/damian5466/rpi5-uefi).
 
 ## Drivers
@@ -11,6 +12,13 @@ Drivers are tested against Windows 11 build 26100.9539.
 
 | Driver | Documentation |
 | --- | --- |
+| RP1 package architecture and header wiring | [RP1 header guide](RP1-HEADER.md) |
+| RP1 interrupt service | [rp1-service](rp1-service/README.md) |
+| RP1 clock service | [rp1-clocks](rp1-clocks/README.md) |
+| RP1 GPIO / pin control | [rp1-gpio](rp1-gpio/README.md) |
+| RP1 UART | [rp1-uart](rp1-uart/README.md) |
+| RP1 I²C | [rp1-i2c](rp1-i2c/README.md) |
+| RP1 SPI | [rp1-spi](rp1-spi/README.md) |
 | RP1 Ethernet | [rp1-ethernet](rp1-ethernet/README.md) |
 | BCM2712 temperature and RNG | [bcm2712-platform](bcm2712-platform/README.md) |
 | RP1 PWM fan control | [rp1-fan](rp1-fan/README.md) |
@@ -25,11 +33,22 @@ INF, CAT and PDB files for the C drivers in `Build/<driver>`. It uses `/W4 /WX`;
 `-Analyze` also enables MSVC static analysis. Run commands from this repository's
 root.
 
-To build all four drivers compiled from C sources:
+To build all drivers compiled from C sources:
 
 ```powershell
 .\build.ps1 -Driver source -FirmwareRoot C:\Sources\rpi5-uefi -Analyze
 ```
+
+Build the RP1 package, including its shared providers and header functions:
+
+```powershell
+.\build.ps1 -Driver rp1 -Configuration Debug -Analyze
+```
+
+`-Configuration Release` is the default. Debug uses `DBG=1` and disables
+optimization; both configurations include separate PDBs. GPIO, UART, I²C and
+SPI packages include desktop command-line tools. All hardware tests are opt-in;
+installing a driver does not start a loopback or display test.
 
 The firmware source argument is required by the included
 [NVRAM driver](pi5-nvram/README.md#build). To build one package, use the

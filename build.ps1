@@ -2,7 +2,7 @@
 # Build the ARM64 kernel drivers from a local checkout with MSVC and the WDK.
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'source', 'nvme', 'rp1-ethernet', 'bcm2712-platform', 'rp1-fan', 'pi5-nvram')]
+    [ValidateSet('all', 'source', 'rp1', 'nvme', 'rp1-service', 'rp1-clocks', 'rp1-gpio', 'rp1-uart', 'rp1-i2c', 'rp1-spi', 'rp1-ethernet', 'bcm2712-platform', 'rp1-fan', 'pi5-nvram')]
     [string]$Driver = 'all',
     [string]$Output = (Join-Path $PSScriptRoot 'Build'),
     [string]$FirmwareRoot = '',
@@ -19,6 +19,8 @@ param(
     [switch]$NvmeAnyDevice,
     [string]$Python = 'python',
     [string]$CertificateThumbprint = '',
+    [ValidateSet('Debug', 'Release')]
+    [string]$Configuration = 'Release',
     [switch]$Analyze
 )
 $ErrorActionPreference = 'Stop'
@@ -58,7 +60,8 @@ if ($CertificateThumbprint) {
     if ($CertificateThumbprint -notmatch '^[0-9A-Fa-f]{40}$') { throw 'CertificateThumbprint must be a SHA-1 certificate thumbprint.' }
     Require-File $sign
 }
-$names = if ($Driver -in 'all','source') { @('rp1-ethernet','bcm2712-platform','rp1-fan','pi5-nvram') } else { @($Driver) }
+$rp1Drivers = @('rp1-service','rp1-clocks','rp1-gpio','rp1-uart','rp1-i2c','rp1-spi','rp1-ethernet','rp1-fan')
+$names = if ($Driver -in 'all','source') { $rp1Drivers + @('bcm2712-platform','pi5-nvram') } elseif ($Driver -eq 'rp1') { $rp1Drivers } else { @($Driver) }
 if ($Driver -eq 'all') { $names = @('nvme') + $names }
 if ('pi5-nvram' -in $names) {
     if (!$FirmwareRoot) { throw 'Supply -FirmwareRoot with the path to the matching rpi5-uefi checkout to build the NVRAM driver.' }
@@ -71,7 +74,7 @@ if ('pi5-nvram' -in $names) {
     }
 }
 if ('nvme' -in $names) {
-    if (!$NvmeDriver -or !$NvmeInf) { throw 'The NVMe build requires -NvmeDriver and -NvmeInf from matching original ARM64 Windows media. Use -Driver source to build only the four C-source drivers.' }
+    if (!$NvmeDriver -or !$NvmeInf) { throw 'The NVMe build requires -NvmeDriver and -NvmeInf from matching original ARM64 Windows media. Use -Driver source to build only the source drivers.' }
     if (!$NvmeAnyDevice -and !$NvmeHardwareId) { throw 'The NVMe build requires -NvmeHardwareId or -NvmeAnyDevice.' }
     Require-File $NvmeDriver
     Require-File $NvmeInf
@@ -109,6 +112,12 @@ foreach ($name in $names) {
         Require-File (Join-Path $kmdfLib 'wdfldr.lib')
     }
     $binary = switch ($name) {
+        'rp1-service' { 'Pi5Rp1' }
+        'rp1-clocks' { 'Pi5Rp1Clock' }
+        'rp1-gpio' { 'Pi5Gpio' }
+        'rp1-uart' { 'Pi5Uart' }
+        'rp1-i2c' { 'Pi5I2c' }
+        'rp1-spi' { 'Pi5Spi' }
         'rp1-ethernet' { 'Pi5Ethernet' }
         'bcm2712-platform' { 'Pi5Platform' }
         'rp1-fan' { 'Pi5Fan' }
@@ -119,7 +128,10 @@ foreach ($name in $names) {
     # A separate work directory prevents stale objects and catalogs from entering a package.
     $work = Join-Path $Output ('.work\' + $name + '-' + [Guid]::NewGuid().ToString('N'))
     New-Item $work -ItemType Directory -Force | Out-Null
-    Get-ChildItem $source -File | Where-Object { $_.Extension -in '.c','.h','.inf' } | Copy-Item -Destination $work
+    Get-ChildItem $source -File | Where-Object { $_.Extension -in '.c','.cpp','.h','.inf' } | Copy-Item -Destination $work
+    if ($name -in 'rp1-service','rp1-clocks','rp1-gpio','rp1-uart','rp1-i2c','rp1-spi') {
+        Copy-Item (Join-Path $PSScriptRoot 'common\*.h') $work
+    }
     if ($name -eq 'pi5-nvram') {
         New-Item (Join-Path $work 'Library') -ItemType Directory | Out-Null
         Copy-Item "$firmware\Library\NvramFileLib\NvramFileLib.c" $work
@@ -127,6 +139,10 @@ foreach ($name in $names) {
         Copy-Item "$firmware\Include\Library\NvramFileLib.h" (Join-Path $work 'Library')
     }
     $sources = switch ($name) {
+        'rp1-service' { 'driver.c' }
+        'rp1-clocks' { 'driver.c rates.c' }
+        'rp1-gpio' { 'driver.c hardware.c' }
+        'rp1-uart' { 'driver.c hardware.c' }
         'rp1-ethernet' { 'miniport.c gem.c' }
         'pi5-nvram' { 'driver.c NvramFileLib.c' }
         'rp1-fan' { 'driver.c hardware.c temperature.c' }
@@ -148,7 +164,18 @@ foreach ($name in $names) {
         $libraries = '/LIBPATH:"' + $kmdfLib + '" wdfdriverentry.lib wdfldr.lib ' + $libraries
         $entry = 'FxDriverEntry'
     }
-    $compile = 'cl /nologo /TC /W4 /WX /O2 /kernel /Zi /external:anglebrackets /external:W0 ' + $defines + ' ' + $includes + ' /c ' + $sources
+    if ($name -eq 'rp1-gpio') { $libraries += ' msgpioclxstub.lib' }
+    if ($name -in 'rp1-service','rp1-clocks') { $libraries += ' wdmsec.lib' }
+    if ($name -eq 'rp1-uart') {
+        $includes += ' /I"' + (Join-Path $kernelInclude 'sercx\2.0') + '"'
+        $libraries += ' /LIBPATH:"' + (Join-Path $kernelLib 'sercx\2.0') + '" sercxstubs.lib'
+    }
+    if ($name -in 'rp1-i2c','rp1-spi') {
+        $includes += ' /I"' + (Join-Path $kernelInclude 'spb\1.1') + '"'
+        $libraries += ' /LIBPATH:"' + (Join-Path $kernelLib 'spb\1.1') + '" spbcxstubs.lib'
+    }
+    $optimization = if ($Configuration -eq 'Debug') { '/Od /DDBG=1' } else { '/O2 /DDBG=0' }
+    $compile = 'cl /nologo /TC /W4 /WX ' + $optimization + ' /kernel /Zi /external:anglebrackets /external:W0 ' + $defines + ' ' + $includes + ' /c ' + $sources
     if ($Analyze) { $compile += ' /analyze /analyze:external-' }
     Push-Location $work
     try {
@@ -172,6 +199,13 @@ foreach ($name in $names) {
         New-Item $package -ItemType Directory -Force | Out-Null
         Copy-Item "$staging\*" $package -Force
         Copy-Item "$binary.pdb" $package -Force
+        if ($name -in 'rp1-gpio','rp1-uart','rp1-i2c','rp1-spi') {
+            $toolSource = $name.Substring(4) + '.cpp'
+            $toolName = $binary + 'Tool.exe'
+            & cmd.exe /d /s /c ($init + ' && cl /nologo /EHsc /std:c++20 /W4 /WX /O2 /external:anglebrackets /external:W0 ' + $toolSource + ' /Fe:' + $toolName + ' /link windowsapp.lib cfgmgr32.lib')
+            if ($LASTEXITCODE) { throw "$name desktop tool build failed" }
+            Copy-Item $toolName $package -Force
+        }
         Write-Host "Built $name -> $package"
     } finally {
         Pop-Location
