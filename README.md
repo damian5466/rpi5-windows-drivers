@@ -1,14 +1,15 @@
 # Raspberry Pi 5 Windows ARM64 drivers
 
 Experimental drivers for the RP1 40-pin header, DMA, Ethernet and fan control,
-BCM2712 GPIO, Bluetooth UART and temperature/RNG, board controls, and file-backed UEFI variable persistence, plus a
+BCM2712 GPIO, Bluetooth UART and temperature/RNG, board controls, a hardware
+connection graph provider, and file-backed UEFI variable persistence, plus a
 reproducible stock NVMe patch.
 Use these drivers with the matching [rpi5-uefi firmware](https://github.com/damian5466/rpi5-uefi).
 
 ## Drivers
 
-Each driver's README contains its build command and driver-specific instructions.
-Drivers are tested against Windows 11 build 26100.9539.
+Each driver's README describes its purpose and dependencies.
+Drivers are tested against Windows 11 build 26200.9539.
 
 | Driver | Documentation |
 | --- | --- |
@@ -26,6 +27,12 @@ Drivers are tested against Windows 11 build 26100.9539.
 | BCM2712 Bluetooth UART | [bcm2712-uart](bcm2712-uart/README.md) |
 | CYW43455 Bluetooth H4 transport (bring-up) | [cyw-bluetooth](cyw-bluetooth/README.md) |
 | Board supplies, LEDs and camera enables | [pi5-board](pi5-board/README.md) |
+| Hardware graph and dependency lookup | [pi5-graph](pi5-graph/README.md) |
+| VideoCore mailbox and RTC service | [pi5-mailbox](pi5-mailbox/README.md) |
+| VideoCore firmware clock service | [pi5-fclk](pi5-fclk/README.md) |
+| BCM2712 V3D reset service | [pi5-pm](pi5-pm/README.md) |
+| BCM2712 multimedia IOMMU service | [pi5-iommu](pi5-iommu/README.md) |
+| VideoCore VII hardware, copy and compute service | [pi5-v3d](pi5-v3d/README.md) |
 | RP1 PWM fan control | [rp1-fan](rp1-fan/README.md) |
 | File-backed UEFI variable persistence | [pi5-nvram](pi5-nvram/README.md) |
 | Stock NVMe compatibility patch | [nvme](nvme/README.md) |
