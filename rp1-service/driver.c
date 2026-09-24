@@ -36,10 +36,10 @@ static VOID Enable(RP1_CONTEXT *c, ULONG source, BOOLEAN enable)
 }
 static BOOLEAN Allowed(ULONG source)
 {
-    // Header GPIO banks, Ethernet, I2C, SPI and UARTs. USB is never leased.
+    // Header GPIO banks, Ethernet, I2C, SPI, DMA and UARTs. USB is never leased.
     return source <= 2 || source == 6 || (source >= 7 && source <= 13) ||
         (source >= 19 && source <= 25 && source != 23) ||
-        (source >= 42 && source <= 46) || source == 54 || source == 56;
+        source == 40 || (source >= 42 && source <= 46) || source == 54 || source == 56;
 }
 _Use_decl_annotations_
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)

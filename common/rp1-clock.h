@@ -3,6 +3,10 @@
 #define RP1_CLOCK_NAME L"\\Device\\Pi5Rp1Clock"
 #define IOCTL_RP1_CLOCK_QUERY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_READ_ACCESS)
 #define IOCTL_RP1_CLOCK_UART CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_RP1_CLOCK_DMA CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+typedef struct {
+    ULONG Version, Online, SystemHz, DmaHz, DmaUsers, Control, Divider;
+} RP1_DMA_CLOCK_STATUS;
 typedef struct {
     ULONG Version, Online, SystemHz, UartHz, UartUsers;
     ULONG SystemControl, SystemDivider, UartControl, UartDivider;

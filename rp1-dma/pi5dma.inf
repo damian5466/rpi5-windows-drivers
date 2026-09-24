@@ -4,35 +4,35 @@ Signature="$WINDOWS NT$"
 Class=System
 ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider=%Provider%
-DriverVer=09/23/2026,0.3.0.1
-CatalogFile=pi5rp1clock.cat
+DriverVer=09/23/2026,0.1.0.2
+CatalogFile=pi5dma.cat
 PnpLockdown=1
 [Manufacturer]
 %Provider%=Models,NTarm64.10.0
 [Models.NTarm64.10.0]
-%Device%=Install,ACPI\RPI0003
+%Device%=Install,ACPI\RPI0004
 [SourceDisksNames]
 1=%Device%,,,
 [SourceDisksFiles]
-Pi5Rp1Clock.sys=1
+Pi5Dma.sys=1
 [DestinationDirs]
 DriverCopy=13
 [Install.NT]
 CopyFiles=DriverCopy
 [DriverCopy]
-Pi5Rp1Clock.sys
+Pi5Dma.sys
 [Install.NT.Services]
-AddService=Pi5Rp1Clock,2,Service
+AddService=Pi5Dma,2,Service
 [Service]
 DisplayName=%Device%
 ServiceType=1
 StartType=3
 ErrorControl=1
-ServiceBinary=%13%\Pi5Rp1Clock.sys
+ServiceBinary=%13%\Pi5Dma.sys
 [Install.NT.Wdf]
-KmdfService=Pi5Rp1Clock,WdfSection
+KmdfService=Pi5Dma,WdfSection
 [WdfSection]
 KmdfLibraryVersion=1.33
 [Strings]
 Provider="RPi5 UEFI project"
-Device="RP1 shared clocks (experimental)"
+Device="RP1 AXI DMA copy service (experimental)"
