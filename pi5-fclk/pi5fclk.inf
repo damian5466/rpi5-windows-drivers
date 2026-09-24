@@ -1,0 +1,38 @@
+; SPDX-License-Identifier: BSD-2-Clause-Patent
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+DriverVer=09/24/2026,0.1.0.6
+CatalogFile=pi5fclk.cat
+PnpLockdown=1
+[Manufacturer]
+%Provider%=Models,NTarm64.10.0
+[Models.NTarm64.10.0]
+%Device%=Install,ACPI\RPI1030
+[SourceDisksNames]
+1=%Device%,,,
+[SourceDisksFiles]
+Pi5Fclk.sys=1
+[DestinationDirs]
+DriverCopy=13
+[Install.NT]
+CopyFiles=DriverCopy
+[DriverCopy]
+Pi5Fclk.sys
+[Install.NT.Services]
+AddService=Pi5Fclk,2,Service
+[Service]
+DisplayName=%Device%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\Pi5Fclk.sys
+[Install.NT.Wdf]
+KmdfService=Pi5Fclk,WdfSection
+[WdfSection]
+KmdfLibraryVersion=1.33
+[Strings]
+Provider="RPi5 UEFI project"
+Device="VideoCore firmware clock service"

@@ -2,7 +2,7 @@
 # Build the ARM64 kernel drivers from a local checkout with MSVC and the WDK.
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'source', 'rp1', 'nvme', 'rp1-service', 'rp1-clocks', 'rp1-gpio', 'rp1-uart', 'rp1-i2c', 'rp1-spi', 'rp1-dma', 'rp1-ethernet', 'bcm2712-platform', 'bcm2712-gpio', 'bcm2712-uart', 'cyw-bluetooth', 'pi5-board', 'rp1-fan', 'pi5-nvram')]
+    [ValidateSet('all', 'source', 'rp1', 'nvme', 'rp1-service', 'rp1-clocks', 'rp1-gpio', 'rp1-uart', 'rp1-i2c', 'rp1-spi', 'rp1-dma', 'rp1-ethernet', 'bcm2712-platform', 'bcm2712-gpio', 'bcm2712-uart', 'cyw-bluetooth', 'pi5-board', 'pi5-graph', 'pi5-mailbox', 'pi5-fclk', 'pi5-pm', 'pi5-iommu','pi5-v3d', 'rp1-fan', 'pi5-nvram')]
     [string]$Driver = 'all',
     [string]$Output = (Join-Path $PSScriptRoot 'Build'),
     [string]$FirmwareRoot = '',
@@ -61,7 +61,7 @@ if ($CertificateThumbprint) {
     Require-File $sign
 }
 $rp1Drivers = @('rp1-service','rp1-clocks','rp1-gpio','rp1-uart','rp1-i2c','rp1-spi','rp1-dma','rp1-ethernet','rp1-fan')
-$names = if ($Driver -in 'all','source') { $rp1Drivers + @('bcm2712-platform','bcm2712-gpio','bcm2712-uart','cyw-bluetooth','pi5-board','pi5-nvram') } elseif ($Driver -eq 'rp1') { $rp1Drivers } else { @($Driver) }
+$names = if ($Driver -in 'all','source') { $rp1Drivers + @('bcm2712-platform','bcm2712-gpio','bcm2712-uart','cyw-bluetooth','pi5-board','pi5-graph','pi5-mailbox','pi5-fclk','pi5-pm','pi5-iommu','pi5-v3d','pi5-nvram') } elseif ($Driver -eq 'rp1') { $rp1Drivers } else { @($Driver) }
 if ($Driver -eq 'all') { $names = @('nvme') + $names }
 if ('pi5-nvram' -in $names) {
     if (!$FirmwareRoot) { throw 'Supply -FirmwareRoot with the path to the matching rpi5-uefi checkout to build the NVRAM driver.' }
@@ -125,6 +125,12 @@ foreach ($name in $names) {
         'bcm2712-uart' { 'Pi5BcmUart' }
         'cyw-bluetooth' { 'Pi5Bluetooth' }
         'pi5-board' { 'Pi5Board' }
+        'pi5-graph' { 'Pi5Graph' }
+        'pi5-mailbox' { 'Pi5Mailbox' }
+        'pi5-fclk' { 'Pi5Fclk' }
+        'pi5-pm' { 'Pi5Pm' }
+        'pi5-iommu' { 'Pi5Iommu' }
+        'pi5-v3d' { 'Pi5V3d' }
         'rp1-fan' { 'Pi5Fan' }
         'pi5-nvram' { 'Pi5Nvram' }
     }
@@ -134,7 +140,7 @@ foreach ($name in $names) {
     $work = Join-Path $Output ('.work\' + $name + '-' + [Guid]::NewGuid().ToString('N'))
     New-Item $work -ItemType Directory -Force | Out-Null
     Get-ChildItem $source -File | Where-Object { $_.Extension -in '.c','.cpp','.h','.inf' } | Copy-Item -Destination $work
-    if ($name -in 'rp1-service','rp1-clocks','rp1-gpio','rp1-uart','rp1-i2c','rp1-spi','rp1-dma','rp1-ethernet') {
+    if ($name -in 'rp1-service','rp1-clocks','rp1-gpio','rp1-uart','rp1-i2c','rp1-spi','rp1-dma','rp1-ethernet','pi5-graph','pi5-mailbox','pi5-fclk','pi5-pm','pi5-iommu','pi5-v3d') {
         Copy-Item (Join-Path $PSScriptRoot 'common\*.h') $work
     }
     if ($name -eq 'pi5-nvram') {
@@ -149,6 +155,12 @@ foreach ($name in $names) {
         'bcm2712-gpio' { 'driver.c hardware.c layout.c' }
         'cyw-bluetooth' { 'driver.c Fdo.c io.c pdo.c device.c' }
         'pi5-board' { 'driver.c' }
+        'pi5-graph' { 'driver.c graph.c' }
+        'pi5-mailbox' { 'driver.c mailbox.c' }
+        'pi5-fclk' { 'driver.c' }
+        'pi5-pm' { 'driver.c hardware.c' }
+        'pi5-iommu' { 'driver.c hardware.c' }
+        'pi5-v3d' { 'driver.c hardware.c' }
         'rp1-gpio' { 'driver.c hardware.c' }
         'rp1-uart' { 'driver.c hardware.c' }
         'rp1-ethernet' { 'miniport.c gem.c' }
@@ -173,7 +185,8 @@ foreach ($name in $names) {
         $entry = 'FxDriverEntry'
     }
     if ($name -in 'rp1-gpio','bcm2712-gpio') { $libraries += ' msgpioclxstub.lib' }
-    if ($name -in 'rp1-service','rp1-clocks','rp1-dma','pi5-board') { $libraries += ' wdmsec.lib' }
+    if ($name -in 'rp1-service','rp1-clocks','rp1-dma','pi5-board','pi5-graph','pi5-mailbox','pi5-fclk','pi5-pm','pi5-iommu','pi5-v3d') { $libraries += ' wdmsec.lib' }
+    if ($name -eq 'pi5-mailbox') { $libraries += ' oprghdlr.lib' }
     if ($name -in 'rp1-uart','bcm2712-uart') {
         $includes += ' /I"' + (Join-Path $kernelInclude 'sercx\2.0') + '"'
         $libraries += ' /LIBPATH:"' + (Join-Path $kernelLib 'sercx\2.0') + '" sercxstubs.lib'
@@ -241,6 +254,12 @@ foreach ($name in $names) {
             & cmd.exe /d /s /c ($init + ' && cl /nologo /W4 /WX /O2 boardctl.c /Fe:Pi5BoardTool.exe')
             if ($LASTEXITCODE) { throw 'Board desktop tool build failed' }
             Copy-Item Pi5BoardTool.exe $package -Force
+        }
+        if ($name -eq 'pi5-graph') {
+            & cmd.exe /d /s /c ($init + ' && cl /nologo /W4 /WX /O2 graphctl.c /Fe:Pi5GraphTool.exe')
+            if ($LASTEXITCODE) { throw 'Graph desktop tool build failed' }
+            Copy-Item Pi5GraphTool.exe $package -Force
+            Copy-Item "$work\pi5-graph.h" $package -Force
         }
         Write-Host "Built $name -> $package"
     } finally {
