@@ -1,7 +1,7 @@
 # Raspberry Pi 5 Windows ARM64 drivers
 
-Experimental drivers for the RP1 40-pin header, Ethernet and fan control,
-BCM2712 GPIO and temperature/RNG, board controls, and file-backed UEFI variable persistence, plus a
+Experimental drivers for the RP1 40-pin header, DMA, Ethernet and fan control,
+BCM2712 GPIO, Bluetooth UART and temperature/RNG, board controls, and file-backed UEFI variable persistence, plus a
 reproducible stock NVMe patch.
 Use these drivers with the matching [rpi5-uefi firmware](https://github.com/damian5466/rpi5-uefi).
 
@@ -19,9 +19,12 @@ Drivers are tested against Windows 11 build 26100.9539.
 | RP1 UART | [rp1-uart](rp1-uart/README.md) |
 | RP1 I²C | [rp1-i2c](rp1-i2c/README.md) |
 | RP1 SPI | [rp1-spi](rp1-spi/README.md) |
+| RP1 DMA copy service | [rp1-dma](rp1-dma/README.md) |
 | RP1 Ethernet | [rp1-ethernet](rp1-ethernet/README.md) |
 | BCM2712 temperature and RNG | [bcm2712-platform](bcm2712-platform/README.md) |
 | BCM2712 GPIO and power button | [bcm2712-gpio](bcm2712-gpio/README.md) |
+| BCM2712 Bluetooth UART | [bcm2712-uart](bcm2712-uart/README.md) |
+| CYW43455 Bluetooth H4 transport (bring-up) | [cyw-bluetooth](cyw-bluetooth/README.md) |
 | Board supplies, LEDs and camera enables | [pi5-board](pi5-board/README.md) |
 | RP1 PWM fan control | [rp1-fan](rp1-fan/README.md) |
 | File-backed UEFI variable persistence | [pi5-nvram](pi5-nvram/README.md) |
@@ -71,6 +74,9 @@ Test-signed packages require a target configured for test signing.
 
 ## License
 
-The C drivers and build script carry the BSD-2-Clause-Patent SPDX identifier.
+The original C drivers and build script carry the BSD-2-Clause-Patent SPDX identifier.
+The adapted `cyw-bluetooth` transport is MS-PL; its embedded Cypress firmware
+has a separate binary redistribution license. See that directory's README and
+license files. Both licenses accompany its built package.
 The NVMe patch recipe requires user-supplied Microsoft inputs; no stock or patched
 Microsoft driver binaries, SDK/WDK files, or signing keys are distributed here.

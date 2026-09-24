@@ -9,6 +9,8 @@ interrupt. See [package architecture](../RP1-HEADER.md).
 
 Version 0.3.0.0 also permits Ethernet source 6. The Ethernet miniport holds the
 same per-file lease as header clients; USB sources remain excluded.
+Version 0.4.0.0 adds DMA source 40 to the allowlist, with the same ownership
+and cleanup rules.
 
 The driver maps only the interrupt configuration page from its translated
 resources. It does not reset RP1, claim SRAM, alter MIP, or enable every device.

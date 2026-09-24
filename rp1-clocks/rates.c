@@ -17,13 +17,12 @@ static ULONG Pll(PUCHAR registers, ULONG base)
     rate = 50000000ull * feedback / ((ULONGLONG)ref * d1 * d2 << 24);
     return rate <= 0xffffffffu ? (ULONG)rate : 0;
 }
-ULONG Rp1ClockRate(PUCHAR Registers, BOOLEAN Uart)
+static ULONG ClockRate(PUCHAR Registers, ULONG base, BOOLEAN Gated)
 {
-    ULONG base = Uart ? RP1_CLK_UART : RP1_CLK_SYS;
     ULONG control = Read(Registers, base), divider = Read(Registers, base + 4), parent = 0;
     // CLK_SYS is a glitchless, always-running clock with no ENABLE field.
-    if (Uart && !(control & RP1_CLK_ENABLE)) return 0;
-    if (Uart) {
+    if (Gated && !(control & RP1_CLK_ENABLE)) return 0;
+    if (Gated) {
         switch ((control >> 5) & 0x1f) {
         case 0:
             if (Read(Registers, 0x8010) & 0x10) parent = Pll(Registers, 0x8000) / 2;
@@ -44,3 +43,7 @@ ULONG Rp1ClockRate(PUCHAR Registers, BOOLEAN Uart)
     // The RP1 clock driver defines divider zero as 65536.
     return parent / (divider ? divider : 65536);
 }
+ULONG Rp1ClockRate(PUCHAR Registers, BOOLEAN Uart)
+{ return ClockRate(Registers, Uart ? RP1_CLK_UART : RP1_CLK_SYS, Uart); }
+ULONG Rp1DmaClockRate(PUCHAR Registers)
+{ return ClockRate(Registers, RP1_CLK_DMA, TRUE); }

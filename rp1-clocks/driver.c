@@ -9,8 +9,10 @@ typedef struct {
     WDFWAITLOCK Lock;
     ULONG Users, SavedControl, SavedDivider;
     BOOLEAN Online, Changed;
+    ULONG DmaUsers, DmaSavedControl, DmaSavedDivider;
+    BOOLEAN DmaChanged;
 } CLOCK_CONTEXT;
-typedef struct { BOOLEAN Uart; } CLOCK_FILE;
+typedef struct { BOOLEAN Uart, Dma; } CLOCK_FILE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(CLOCK_CONTEXT, ClockContext)
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(CLOCK_FILE, ClockFile)
 DRIVER_INITIALIZE DriverEntry;
@@ -37,6 +39,21 @@ static VOID EnableUart(CLOCK_CONTEXT *c)
     Write(c, RP1_CLK_UART, 2u << 5);
     Write(c, RP1_CLK_UART + 4, 1);
     Write(c, RP1_CLK_UART, (2u << 5) | RP1_CLK_ENABLE);
+}
+static VOID EnableDma(CLOCK_CONTEXT *c)
+{
+    // A disabled DMA gate can use XOSC / 1 (50 MHz, below the 100 MHz limit).
+    // Preserve an already enabled gate; never change a shared PLL.
+    Write(c, RP1_CLK_DMA, 2u << 5);
+    Write(c, RP1_CLK_DMA + 4, 1);
+    Write(c, RP1_CLK_DMA, (2u << 5) | RP1_CLK_ENABLE);
+}
+static VOID RestoreDma(CLOCK_CONTEXT *c)
+{
+    if (!c->DmaChanged) return;
+    Write(c, RP1_CLK_DMA, Read(c, RP1_CLK_DMA) & ~RP1_CLK_ENABLE);
+    Write(c, RP1_CLK_DMA + 4, c->DmaSavedDivider);
+    Write(c, RP1_CLK_DMA, c->DmaSavedControl);
 }
 static VOID Restore(CLOCK_CONTEXT *c)
 {
@@ -123,6 +140,7 @@ NTSTATUS ClockStart(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Previous)
     UNREFERENCED_PARAMETER(Previous);
     WdfWaitLockAcquire(c->Lock, NULL);
     if (c->Users && c->Changed) EnableUart(c);
+    if (c->DmaUsers && c->DmaChanged) EnableDma(c);
     c->Online = TRUE;
     WdfWaitLockRelease(c->Lock);
     return STATUS_SUCCESS;
@@ -133,7 +151,7 @@ NTSTATUS ClockStop(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Target)
     CLOCK_CONTEXT *c = ClockContext(Device);
     UNREFERENCED_PARAMETER(Target);
     WdfWaitLockAcquire(c->Lock, NULL);
-    Restore(c); c->Online = FALSE;
+    Restore(c); RestoreDma(c); c->Online = FALSE;
     WdfWaitLockRelease(c->Lock);
     return STATUS_SUCCESS;
 }
@@ -143,7 +161,7 @@ NTSTATUS ClockQueryRemove(WDFDEVICE Device)
     CLOCK_CONTEXT *c = ClockContext(Device);
     NTSTATUS status;
     WdfWaitLockAcquire(c->Lock, NULL);
-    status = c->Users ? STATUS_DEVICE_BUSY : STATUS_SUCCESS;
+    status = (c->Users || c->DmaUsers) ? STATUS_DEVICE_BUSY : STATUS_SUCCESS;
     WdfWaitLockRelease(c->Lock);
     return status;
 }
@@ -161,7 +179,47 @@ VOID ClockCleanup(WDFFILEOBJECT File)
             c->Changed = FALSE;
         }
     }
+    if (ClockFile(File)->Dma) {
+        ClockFile(File)->Dma = FALSE;
+        if (--c->DmaUsers == 0) {
+            if (c->Online) RestoreDma(c);
+            c->DmaChanged = FALSE;
+        }
+    }
     WdfWaitLockRelease(c->Lock);
+}
+static VOID DmaClockIo(CLOCK_CONTEXT *c, WDFREQUEST Request)
+{
+    RP1_DMA_CLOCK_STATUS *r;
+    CLOCK_FILE *f;
+    NTSTATUS status;
+    if (!WdfRequestGetFileObject(Request) || WdfRequestGetRequestorMode(Request) != KernelMode) {
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST); return;
+    }
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*r), (PVOID *)&r, NULL);
+    if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
+    WdfWaitLockAcquire(c->Lock, NULL);
+    f = ClockFile(WdfRequestGetFileObject(Request));
+    if (!c->Online) status = STATUS_DEVICE_NOT_READY;
+    else if (!f->Dma) {
+        if (!c->DmaUsers) {
+            c->DmaSavedControl = Read(c, RP1_CLK_DMA);
+            c->DmaSavedDivider = Read(c, RP1_CLK_DMA + 4);
+            c->DmaChanged = !(c->DmaSavedControl & RP1_CLK_ENABLE);
+            if (c->DmaChanged) EnableDma(c);
+        }
+        if (!Rp1DmaClockRate(c->Registers) || Rp1DmaClockRate(c->Registers) > 100000000) {
+            if (!c->DmaUsers) { RestoreDma(c); c->DmaChanged = FALSE; }
+            status = STATUS_DEVICE_CONFIGURATION_ERROR;
+        } else { ++c->DmaUsers; f->Dma = TRUE; }
+    }
+    if (NT_SUCCESS(status)) {
+        RtlZeroMemory(r, sizeof(*r)); r->Version = 1; r->Online = c->Online;
+        r->SystemHz = Rp1ClockRate(c->Registers, FALSE); r->DmaHz = Rp1DmaClockRate(c->Registers);
+        r->DmaUsers = c->DmaUsers; r->Control = Read(c, RP1_CLK_DMA); r->Divider = Read(c, RP1_CLK_DMA + 4);
+    }
+    WdfWaitLockRelease(c->Lock);
+    WdfRequestCompleteWithInformation(Request, status, NT_SUCCESS(status) ? sizeof(*r) : 0);
 }
 _Use_decl_annotations_
 VOID ClockIo(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength, size_t InLength, ULONG Code)
@@ -170,6 +228,7 @@ VOID ClockIo(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength, size_t InLeng
     RP1_CLOCK_STATUS *r;
     NTSTATUS status;
     UNREFERENCED_PARAMETER(OutLength); UNREFERENCED_PARAMETER(InLength);
+    if (Code == IOCTL_RP1_CLOCK_DMA) { DmaClockIo(c, Request); return; }
     if ((Code != IOCTL_RP1_CLOCK_QUERY && Code != IOCTL_RP1_CLOCK_UART) ||
         !WdfRequestGetFileObject(Request) ||
         (Code == IOCTL_RP1_CLOCK_UART && WdfRequestGetRequestorMode(Request) != KernelMode)) {
