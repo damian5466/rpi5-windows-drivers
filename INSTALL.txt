@@ -1,0 +1,22 @@
+Raspberry Pi 5 Windows ARM64 drivers
+
+Use Windows 11 ARM64 and the matching rpi5-uefi firmware. These packages
+are test-signed; Windows must have test signing enabled. From an elevated
+terminal, enable it with "bcdedit /set testsigning on", then restart Windows.
+Secure Boot must be disabled for test signing.
+
+Extract the entire driver ZIP. In native ARM64 PowerShell, as Administrator:
+
+  powershell.exe -ExecutionPolicy Bypass -File .\install.ps1 -TrustTestCertificate
+
+This explicitly trusts the included public test certificate, verifies the
+release, stages every package, then installs matching drivers and the NVRAM
+service. Restart Windows if requested. The installer does not force a
+downgrade over a newer or better-ranked installed driver.
+
+To verify files and trusted signatures without installing drivers:
+
+  powershell.exe -ExecutionPolicy Bypass -File .\install.ps1 -VerifyOnly
+
+The symbols ZIP is separate and is not required for installation.
+Driver descriptions and dependencies are in the individual READMEs.

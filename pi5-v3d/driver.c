@@ -5,6 +5,7 @@
 #include "pi5-fclk.h"
 #include "pi5-pm.h"
 #include "pi5-graph.h"
+#include "pi5-power-relations.h"
 #include "hardware.h"
 #include "shader.h"
 
@@ -16,6 +17,7 @@ typedef struct {
 } V3D_BUFFER;
 typedef struct {
     V3D_BUFFER Buffer;
+    PMDL ImportedMdl;
     ULONG Handle, Address, Bytes, Flags;
 } V3D_OBJECT;
 typedef struct {
@@ -30,14 +32,18 @@ typedef struct {
     PDMA_ADAPTER Adapter;
     V3D_BUFFER Table, Trap, Source, Destination, Code, Uniform, Tile, TileState;
     V3D_OBJECT Objects[PI5_V3D_BUFFER_LIMIT];
-    ULONG ObjectSerial, ObjectBytes;
+    ULONG ObjectSerial, ObjectBytes, ImportedBytes;
     ULONGLONG MemorySubmitted, MemoryCompleted;
-    BOOLEAN MemorySession;
+    BOOLEAN MemorySession, GuardsClean;
     WDFFILEOBJECT Owner;
     BOOLEAN ClockLease, PmLease, Powered, Claimed, Woke;
     PI5_V3D_STATUS Status;
     PI5_V3D_COMPUTE_STATUS ComputeStatus;
     PI5_V3D_RENDER_STATUS RenderStatus;
+#if DBG
+    BOOLEAN ProfileEnabled;
+    PI5_V3D_PROFILE Profile;
+#endif
 } V3D_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(V3D_CONTEXT, Context)
 static volatile LONG BootFault;
@@ -59,6 +65,26 @@ EVT_WDF_INTERRUPT_DPC Dpc;
 EVT_WDF_INTERRUPT_ENABLE InterruptEnable;
 EVT_WDF_INTERRUPT_DISABLE InterruptDisable;
 EVT_WDF_IO_TARGET_QUERY_REMOVE TargetQueryRemove;
+EVT_WDFDEVICE_WDM_IRP_PREPROCESS V3dPowerRelations;
+
+_Use_decl_annotations_
+NTSTATUS V3dPowerRelations(WDFDEVICE device, PIRP irp)
+{
+    V3D_CONTEXT *c = Context(device);
+    NTSTATUS status;
+    if (IoGetCurrentIrpStackLocation(irp)->Parameters.QueryDeviceRelations.Type == PowerRelations) {
+        WDFIOTARGET targets[2];
+        WdfWaitLockAcquire(c->Lock, NULL);
+        targets[0] = c->Clock; targets[1] = c->Pm;
+        status = Pi5AppendPowerRelations(irp, targets, RTL_NUMBER_OF(targets));
+        WdfWaitLockRelease(c->Lock);
+        if (!NT_SUCCESS(status)) {
+            irp->IoStatus.Status = status; IoCompleteRequest(irp, IO_NO_INCREMENT); return status;
+        }
+    }
+    IoSkipCurrentIrpStackLocation(irp);
+    return WdfDeviceWdmDispatchPreprocessedIrp(device, irp);
+}
 
 static uint32_t Read(void *context, uint32_t unit, uint32_t offset)
 {
@@ -156,6 +182,7 @@ static NTSTATUS Open(V3D_CONTEXT *c, PCWSTR path, ACCESS_MASK access, WDFIOTARGE
     p.EvtIoTargetQueryRemove = TargetQueryRemove;
     s = WdfIoTargetOpen(*target, &p);
     if (!NT_SUCCESS(s)) { WdfObjectDelete(*target); *target = NULL; }
+    else IoInvalidateDeviceRelations(WdfDeviceWdmGetPhysicalDevice(c->Device), PowerRelations);
     return s;
 }
 static VOID Close(WDFIOTARGET *target)
@@ -181,6 +208,11 @@ static NTSTATUS Clock(V3D_CONTEXT *c, ULONG code, ULONG value)
     NTSTATUS s = Send(c->Clock, code, &in, sizeof(in), &out, sizeof(out));
     if (s == STATUS_SUCCESS && (out.Version != 1 || out.Id != 5 ||
         (out.Flags & PI5_FCLK_FLAG_UNCERTAIN))) return STATUS_DEVICE_PROTOCOL_ERROR;
+    /* Match Linux's firmware-clock maximize policy while V3D is owned.
+     * SET_STATE alone leaves the firmware's minimum-rate boot vote in place.
+     * The existing lease restores the original rate after the GPU is idle. */
+    if (s == STATUS_SUCCESS && code == IOCTL_PI5_FCLK_SET_STATE && value &&
+        out.MaxHz > out.RateHz) return Clock(c, IOCTL_PI5_FCLK_SET_RATE, out.MaxHz);
     return s;
 }
 static NTSTATUS Pm(V3D_CONTEXT *c, ULONG code)
@@ -238,6 +270,7 @@ Done:
 
 static VOID FreeBuffer(V3D_CONTEXT *c, V3D_BUFFER *b)
 {
+    c->GuardsClean = FALSE;
     if (b->Cpu) {
         c->Adapter->DmaOperations->FreeCommonBuffer(c->Adapter, b->Bytes, b->Dma, (PVOID)b->Cpu, FALSE);
         c->Status.AllocatedBytes -= b->Bytes; RtlZeroMemory(b, sizeof(*b));
@@ -247,6 +280,7 @@ static NTSTATUS Allocate(V3D_CONTEXT *c, V3D_BUFFER *b, ULONG bytes)
 {
     PHYSICAL_ADDRESS maximum;
     ULONG i;
+    c->GuardsClean = FALSE;
     maximum.QuadPart = (1ull << 36) - 1;
     b->Bytes = bytes + 2 * V3D_PAGE;
     b->Cpu = c->Adapter->DmaOperations->AllocateCommonBufferEx(c->Adapter,
@@ -268,6 +302,12 @@ static NTSTATUS Guards(V3D_CONTEXT *c)
     V3D_BUFFER *buffers[] = {&c->Table, &c->Trap, &c->Source, &c->Destination,
         &c->Code, &c->Uniform, &c->Tile, &c->TileState};
     ULONG i, j;
+    /* The serialized CPU transfer path validates every write extent. Once
+     * checked, guards cannot change until another allocation or a legacy GPU
+     * job. Memory sessions leave guard pages unmapped and fault on invalid
+     * GPU accesses; their bounded CPU transfers cannot modify these pages.
+     * Diagnostic queries and End still force a complete physical scan. */
+    if (c->GuardsClean) return STATUS_SUCCESS;
     for (i = 0; i < RTL_NUMBER_OF(buffers); ++i) {
         V3D_BUFFER *b = buffers[i];
         if (!b->Cpu) continue;
@@ -284,7 +324,9 @@ static NTSTATUS Guards(V3D_CONTEXT *c)
             if (b->Cpu[j] != GUARD || b->Cpu[(b->Bytes - V3D_PAGE) / 4 + j] != GUARD)
                 ++c->Status.GuardFailures;
     }
-    return c->Status.GuardFailures || c->Status.ScratchWrites ? STATUS_DATA_ERROR : STATUS_SUCCESS;
+    if (c->Status.GuardFailures || c->Status.ScratchWrites) return STATUS_DATA_ERROR;
+    c->GuardsClean = TRUE;
+    return STATUS_SUCCESS;
 }
 static VOID Mask(V3D_CONTEXT *c, BOOLEAN enable)
 {
@@ -303,6 +345,7 @@ static VOID Mask(V3D_CONTEXT *c, BOOLEAN enable)
 static NTSTATUS Reset(V3D_CONTEXT *c)
 {
     NTSTATUS s;
+    c->GuardsClean = FALSE;
     c->Status.Phase = 10;
     Mask(c, FALSE);
     s = Hw(V3dDrain(&c->Io));
@@ -335,6 +378,7 @@ static NTSTATUS DropProviders(V3D_CONTEXT *c)
         c->ClockLease = FALSE;
     }
     Close(&c->Pm); Close(&c->Clock); c->Owner = NULL;
+    IoInvalidateDeviceRelations(WdfDeviceWdmGetPhysicalDevice(c->Device), PowerRelations);
     WdfDeviceSetStaticStopRemove(c->Device, TRUE);
     return STATUS_SUCCESS;
 }
@@ -342,6 +386,7 @@ static NTSTATUS End(V3D_CONTEXT *c)
 {
     NTSTATUS s;
     ULONG i;
+    c->GuardsClean = FALSE;
     if (BootFault) return STATUS_DEVICE_HARDWARE_ERROR;
     c->Status.Phase = 20;
     if (c->Claimed) {
@@ -370,7 +415,7 @@ static NTSTATUS End(V3D_CONTEXT *c)
         FreeBuffer(c, &c->Objects[i].Buffer);
         RtlZeroMemory(&c->Objects[i], sizeof(c->Objects[i]));
     }
-    c->ObjectBytes = 0; c->MemorySession = FALSE;
+    c->ObjectBytes = 0; c->ImportedBytes = 0; c->MemorySession = FALSE;
     FreeBuffer(c, &c->TileState); FreeBuffer(c, &c->Tile);
     FreeBuffer(c, &c->Uniform); FreeBuffer(c, &c->Code);
     FreeBuffer(c, &c->Destination); FreeBuffer(c, &c->Source);
@@ -468,17 +513,12 @@ static V3D_OBJECT *Object(V3D_CONTEXT *c, ULONG handle)
         if (c->Objects[i].Handle == handle) return &c->Objects[i];
     return NULL;
 }
-static NTSTATUS ObjectCreate(V3D_CONTEXT *c, const PI5_V3D_BUFFER *in, PI5_V3D_BUFFER *out)
+static NTSTATUS ObjectPlacement(V3D_CONTEXT *c, ULONG size, V3D_OBJECT **object, ULONG *assigned)
 {
     V3D_OBJECT *o = NULL;
-    ULONG i, page, size = in->Bytes, flags = in->Flags;
+    ULONG i;
     ULONGLONG address = 0x101000;
-    NTSTATUS s;
-    if (!size || size > PI5_V3D_BUFFER_MAX_BYTES || (size & 4095) ||
-        flags & ~PI5_V3D_BUFFER_WRITABLE || in->Handle || in->Address || in->Reserved)
-        return STATUS_INVALID_PARAMETER;
-    if (size > PI5_V3D_MEMORY_MAX_BYTES - c->ObjectBytes || c->ObjectSerial == UINT32_MAX)
-        return STATUS_INSUFFICIENT_RESOURCES;
+    if (c->ObjectSerial == UINT32_MAX) return STATUS_INSUFFICIENT_RESOURCES;
     for (i = 0; i < PI5_V3D_BUFFER_LIMIT; ++i)
         if (!c->Objects[i].Handle) { o = &c->Objects[i]; break; }
     if (!o) return STATUS_INSUFFICIENT_RESOURCES;
@@ -496,6 +536,19 @@ static NTSTATUS ObjectCreate(V3D_CONTEXT *c, const PI5_V3D_BUFFER *in, PI5_V3D_B
         }
         if (!overlap) break;
     }
+    *object = o; *assigned = (ULONG)address;
+    return STATUS_SUCCESS;
+}
+static NTSTATUS ObjectCreate(V3D_CONTEXT *c, const PI5_V3D_BUFFER *in, PI5_V3D_BUFFER *out)
+{
+    V3D_OBJECT *o = NULL;
+    ULONG page, address, size = in->Bytes, flags = in->Flags;
+    NTSTATUS s;
+    if (!size || size > PI5_V3D_BUFFER_MAX_BYTES || (size & 4095) ||
+        flags & ~PI5_V3D_BUFFER_WRITABLE || in->Handle || in->Address || in->Reserved)
+        return STATUS_INVALID_PARAMETER;
+    if (size > PI5_V3D_MEMORY_MAX_BYTES - c->ObjectBytes) return STATUS_INSUFFICIENT_RESOURCES;
+    s = ObjectPlacement(c, size, &o, &address); if (s != STATUS_SUCCESS) return s;
     s = Hw(V3dDrain(&c->Io)); if (s != STATUS_SUCCESS) return Fault(c, s);
     s = Guards(c); if (s != STATUS_SUCCESS) return Fault(c, s);
     s = Allocate(c, &o->Buffer, size); if (s != STATUS_SUCCESS) return s;
@@ -508,6 +561,39 @@ static NTSTATUS ObjectCreate(V3D_CONTEXT *c, const PI5_V3D_BUFFER *in, PI5_V3D_B
     s = Hw(V3dMmuFlush(&c->Io)); if (s != STATUS_SUCCESS) return Fault(c, s);
     RtlZeroMemory(out, sizeof(*out)); out->Version = 1; out->Handle = o->Handle;
     out->Address = o->Address; out->Bytes = size; out->Flags = flags;
+    return STATUS_SUCCESS;
+}
+static NTSTATUS ObjectImport(V3D_CONTEXT *c, const PI5_V3D_BUFFER_IMPORT *in, PI5_V3D_BUFFER *out)
+{
+    V3D_OBJECT *o = NULL;
+    PMDL mdl = (PMDL)(ULONG_PTR)in->Mdl;
+    PPFN_NUMBER pages;
+    ULONG size, page, address;
+    NTSTATUS s;
+    if (in->Flags & ~PI5_V3D_BUFFER_WRITABLE || in->Reserved[0] || in->Reserved[1] ||
+        !mdl || (ULONG_PTR)mdl < (ULONG_PTR)MmSystemRangeStart || ((ULONG_PTR)mdl & (sizeof(PVOID) - 1)))
+        return STATUS_INVALID_PARAMETER;
+    if (!(mdl->MdlFlags & (MDL_PAGES_LOCKED | MDL_SOURCE_IS_NONPAGED_POOL)) ||
+        (mdl->MdlFlags & MDL_PARTIAL) || MmGetMdlByteOffset(mdl)) return STATUS_INVALID_PARAMETER;
+    size = MmGetMdlByteCount(mdl);
+    if (!size || (size & (V3D_PAGE - 1)) || size > PI5_V3D_IMPORT_MAX_BYTES)
+        return STATUS_INVALID_PARAMETER;
+    if (size > PI5_V3D_IMPORT_TOTAL_BYTES - c->ImportedBytes) return STATUS_INSUFFICIENT_RESOURCES;
+    pages = MmGetMdlPfnArray(mdl);
+    for (page = 0; page < size / V3D_PAGE; ++page)
+        if ((ULONGLONG)pages[page] >= (1ull << (36 - PAGE_SHIFT))) return STATUS_INVALID_PARAMETER;
+    s = ObjectPlacement(c, size, &o, &address); if (s != STATUS_SUCCESS) return s;
+    s = Hw(V3dDrain(&c->Io)); if (s != STATUS_SUCCESS) return Fault(c, s);
+    s = Guards(c); if (s != STATUS_SUCCESS) return Fault(c, s);
+    o->Handle = ++c->ObjectSerial; o->Address = address; o->Bytes = size;
+    o->Flags = in->Flags; o->ImportedMdl = mdl; c->ImportedBytes += size;
+    for (page = 0; page < size / V3D_PAGE; ++page)
+        c->Table.Cpu[1024 + address / V3D_PAGE + page] =
+            V3dPte((ULONGLONG)pages[page] << PAGE_SHIFT, !!in->Flags);
+    KeMemoryBarrier();
+    s = Hw(V3dMmuFlush(&c->Io)); if (s != STATUS_SUCCESS) return Fault(c, s);
+    RtlZeroMemory(out, sizeof(*out)); out->Version = 1; out->Handle = o->Handle;
+    out->Address = address; out->Bytes = size; out->Flags = in->Flags;
     return STATUS_SUCCESS;
 }
 static NTSTATUS ObjectDestroy(V3D_CONTEXT *c, const PI5_V3D_BUFFER *in)
@@ -523,7 +609,9 @@ static NTSTATUS ObjectDestroy(V3D_CONTEXT *c, const PI5_V3D_BUFFER *in)
     KeMemoryBarrier();
     s = Hw(V3dMmuFlush(&c->Io)); if (s != STATUS_SUCCESS) return Fault(c, s);
     s = Hw(V3dInvalidate(&c->Io)); if (s != STATUS_SUCCESS) return Fault(c, s);
-    c->ObjectBytes -= o->Bytes; FreeBuffer(c, &o->Buffer); RtlZeroMemory(o, sizeof(*o));
+    if (o->ImportedMdl) c->ImportedBytes -= o->Bytes;
+    else c->ObjectBytes -= o->Bytes;
+    FreeBuffer(c, &o->Buffer); RtlZeroMemory(o, sizeof(*o));
     return STATUS_SUCCESS;
 }
 static NTSTATUS ObjectTransfer(V3D_CONTEXT *c, const PI5_V3D_TRANSFER *in, void *data, BOOLEAN write)
@@ -532,7 +620,7 @@ static NTSTATUS ObjectTransfer(V3D_CONTEXT *c, const PI5_V3D_TRANSFER *in, void 
     ULONG i;
     ULONG *words = data;
     NTSTATUS s;
-    if (!o || !in->Bytes || in->Bytes > PI5_V3D_TRANSFER_MAX_BYTES ||
+    if (!o || o->ImportedMdl || !in->Bytes || in->Bytes > PI5_V3D_TRANSFER_MAX_BYTES ||
         ((in->Offset | in->Bytes) & 3) || in->Offset > o->Bytes || in->Bytes > o->Bytes - in->Offset)
         return STATUS_INVALID_PARAMETER;
     s = Hw(V3dDrain(&c->Io)); if (s != STATUS_SUCCESS) return Fault(c, s);
@@ -564,23 +652,18 @@ static NTSTATUS Wait(V3D_CONTEXT *c, ULONG hub, ULONG core)
 }
 static VOID Arm(V3D_CONTEXT *c)
 {
+    /* MemoryBegin clears the page table, and ObjectCreate/Import map only
+     * payload pages. GPU submissions therefore cannot modify physical guards.
+     * Keep the legacy self-test's per-job scan, including its scratch page. */
+    if (!c->MemorySession) c->GuardsClean = FALSE;
     Mask(c, FALSE);
     InterlockedExchange(&c->Pending[0], 0); InterlockedExchange(&c->Pending[1], 0);
     KeClearEvent(&c->Wake); Mask(c, TRUE);
 }
-static NTSTATUS ObjectCopy(V3D_CONTEXT *c, const PI5_V3D_BUFFER_COPY *in, PI5_V3D_BUFFER_COPY *out)
+static NTSTATUS ObjectTfu(V3D_CONTEXT *c, ULONG width, ULONG height, ULONG source,
+                          ULONG destination, ULONG stride, ULONG config, uint64_t *fence)
 {
-    V3D_OBJECT *source = Object(c, in->Source), *destination = Object(c, in->Destination);
-    ULONG bytes;
     NTSTATUS s;
-    if (!source || !destination || source == destination || !(destination->Flags & PI5_V3D_BUFFER_WRITABLE) ||
-        !in->Width || in->Width > 4096 || !in->Height || in->Height > 4096 ||
-        ((in->SourceOffset | in->DestinationOffset) & 63) || in->Reserved || in->Fence)
-        return STATUS_INVALID_PARAMETER;
-    bytes = in->Width * in->Height * 4;
-    if (in->SourceOffset > source->Bytes || bytes > source->Bytes - in->SourceOffset ||
-        in->DestinationOffset > destination->Bytes || bytes > destination->Bytes - in->DestinationOffset)
-        return STATUS_INVALID_PARAMETER;
     if (c->MemorySubmitted == UINT64_MAX) return STATUS_INTEGER_OVERFLOW;
     s = Hw(V3dDrain(&c->Io)); if (s != STATUS_SUCCESS) return Fault(c, s);
     s = Guards(c); if (s != STATUS_SUCCESS) return Fault(c, s);
@@ -588,8 +671,7 @@ static NTSTATUS ObjectCopy(V3D_CONTEXT *c, const PI5_V3D_BUFFER_COPY *in, PI5_V3
     s = Hw(V3dInvalidate(&c->Io)); if (s != STATUS_SUCCESS) return Fault(c, s);
     Write(c, V3dHub, V3D_GMP_CONFIG, 0);
     Arm(c); ++c->MemorySubmitted; c->Status.Phase = 50;
-    V3dSubmitCopyAt(&c->Io, in->Width, in->Height, source->Address + in->SourceOffset,
-                   destination->Address + in->DestinationOffset);
+    V3dSubmitTransferAt(&c->Io, width, height, source, destination, stride, config);
     s = Wait(c, V3D_TFU_DONE, 0);
     Snapshot(c);
     if (s != STATUS_SUCCESS) { Mask(c, FALSE); return Fault(c, s); }
@@ -597,9 +679,45 @@ static NTSTATUS ObjectCopy(V3D_CONTEXT *c, const PI5_V3D_BUFFER_COPY *in, PI5_V3
     if ((ULONG)c->Pending[0] != V3D_TFU_DONE || c->Pending[1] ||
         Read(c, V3dHub, V3D_MMU_CTL) & V3D_MMU_FAULTS) return Fault(c, STATUS_DEVICE_HARDWARE_ERROR);
     KeMemoryBarrier(); s = Guards(c); if (s != STATUS_SUCCESS) return Fault(c, s);
-    c->MemoryCompleted = c->MemorySubmitted; out->Fence = c->MemoryCompleted;
+    c->MemoryCompleted = c->MemorySubmitted; *fence = c->MemoryCompleted;
     ++c->Status.Copies; c->Status.Phase = 5;
     return STATUS_SUCCESS;
+}
+static NTSTATUS ObjectCopy(V3D_CONTEXT *c, const PI5_V3D_BUFFER_COPY *in, PI5_V3D_BUFFER_COPY *out)
+{
+    V3D_OBJECT *source = Object(c, in->Source), *destination = Object(c, in->Destination);
+    ULONG bytes;
+    if (!source || !destination || !(destination->Flags & PI5_V3D_BUFFER_WRITABLE) ||
+        !in->Width || in->Width > 4096 || !in->Height || in->Height > 4096 ||
+        ((in->SourceOffset | in->DestinationOffset) & 63) || in->Reserved || in->Fence)
+        return STATUS_INVALID_PARAMETER;
+    bytes = in->Width * in->Height * 4;
+    if (in->SourceOffset > source->Bytes || bytes > source->Bytes - in->SourceOffset ||
+        in->DestinationOffset > destination->Bytes || bytes > destination->Bytes - in->DestinationOffset)
+        return STATUS_INVALID_PARAMETER;
+    if (source == destination && in->SourceOffset < in->DestinationOffset + bytes &&
+        in->DestinationOffset < in->SourceOffset + bytes) return STATUS_INVALID_PARAMETER;
+    return ObjectTfu(c, in->Width, in->Height, source->Address + in->SourceOffset,
+                     destination->Address + in->DestinationOffset, in->Width,
+                     in->Width << 16, &out->Fence);
+}
+static NTSTATUS ObjectTile(V3D_CONTEXT *c, const PI5_V3D_BUFFER_TILE *in, PI5_V3D_BUFFER_TILE *out)
+{
+    V3D_OBJECT *source = Object(c, in->Source), *destination = Object(c, in->Destination);
+    uint32_t sourceBytes, destinationBytes, config;
+    if (!source || !destination || !(destination->Flags & PI5_V3D_BUFFER_WRITABLE) ||
+        ((in->SourceOffset | in->DestinationOffset) & 63) || in->Fence ||
+        V3dTextureLayout(in->Width, in->Height, in->SourcePitch, in->Layout, in->OutputRows,
+                         &sourceBytes, &destinationBytes, &config) != V3dOk)
+        return STATUS_INVALID_PARAMETER;
+    if (in->SourceOffset > source->Bytes || sourceBytes > source->Bytes - in->SourceOffset ||
+        in->DestinationOffset > destination->Bytes || destinationBytes > destination->Bytes - in->DestinationOffset)
+        return STATUS_INVALID_PARAMETER;
+    if (source == destination && in->SourceOffset < in->DestinationOffset + destinationBytes &&
+        in->DestinationOffset < in->SourceOffset + sourceBytes) return STATUS_INVALID_PARAMETER;
+    return ObjectTfu(c, in->Width, in->Height, source->Address + in->SourceOffset,
+                     destination->Address + in->DestinationOffset, in->SourcePitch / 4,
+                     config, &out->Fence);
 }
 static BOOLEAN ObjectRange(V3D_CONTEXT *c, ULONG address, ULONG bytes, BOOLEAN writable)
 {
@@ -613,6 +731,32 @@ static BOOLEAN ObjectRange(V3D_CONTEXT *c, ULONG address, ULONG bytes, BOOLEAN w
     }
     return FALSE;
 }
+#if DBG
+static void ProfileStart(V3D_CONTEXT *c)
+{
+    static const UCHAR sources[PI5_V3D_PROFILE_COUNTERS] = {
+        0,1,2,3,18,19,20,21,22,23,24,28,29,39,43,62,
+        66,72,74,77,81,82,83,84,85,86,87,88,89,90,91,92
+    };
+    ULONG i;
+    if (!c->ProfileEnabled) return;
+    Write(c,V3dCore,0x650,0);
+    for (i=0;i<PI5_V3D_PROFILE_COUNTERS;i+=4)
+        Write(c,V3dCore,0x660+i,sources[i]|((ULONG)sources[i+1]<<8)|
+            ((ULONG)sources[i+2]<<16)|((ULONG)sources[i+3]<<24));
+    Write(c,V3dCore,0x650,UINT32_MAX);
+    Write(c,V3dCore,0x654,UINT32_MAX);
+    Write(c,V3dCore,0x658,UINT32_MAX);
+}
+static void ProfileStop(V3D_CONTEXT *c)
+{
+    ULONG i;
+    if (!c->ProfileEnabled) return;
+    Write(c,V3dCore,0x650,0);
+    c->Profile.Overflow=Read(c,V3dCore,0x658);
+    for (i=0;i<PI5_V3D_PROFILE_COUNTERS;++i)c->Profile.Counters[i]=Read(c,V3dCore,0x680+i*4);
+}
+#endif
 static NTSTATUS ObjectSubmit(V3D_CONTEXT *c, const PI5_V3D_SUBMIT_CL *in, PI5_V3D_SUBMIT_CL *out)
 {
     PI5_V3D_RENDER_STATUS *q = &c->RenderStatus;
@@ -639,6 +783,9 @@ static NTSTATUS ObjectSubmit(V3D_CONTEXT *c, const PI5_V3D_SUBMIT_CL *in, PI5_V3
     ++c->MemorySubmitted; ++q->Submitted; ++q->Invalidations;
     q->CommandBytes = in->RclEnd - in->RclStart;
     q->BinBytes = in->BclEnd - in->BclStart;
+#if DBG
+    ProfileStart(c);
+#endif
     if (bin) {
         q->BinBefore = Read(c, V3dCore, 0x134);
         Arm(c); c->Status.Phase = 51;
@@ -658,6 +805,9 @@ static NTSTATUS ObjectSubmit(V3D_CONTEXT *c, const PI5_V3D_SUBMIT_CL *in, PI5_V3
     Arm(c); c->Status.Phase = 52;
     V3dSubmitRenderAt(&c->Io, in->RclStart, in->RclEnd);
     s = Wait(c, 0, V3D_RENDER_DONE);
+#if DBG
+    ProfileStop(c);
+#endif
     q->CtAfter = Read(c, V3dCore, 0x104);
     q->Current = Read(c, V3dCore, 0x114); q->End = Read(c, V3dCore, 0x10c);
     q->QueueCurrent = Read(c, V3dCore, 0x164); q->QueueEnd = Read(c, V3dCore, 0x16c);
@@ -906,6 +1056,11 @@ NTSTATUS Add(WDFDRIVER driver, PWDFDEVICE_INIT init)
     p.EvtDeviceD0Entry = Entry; p.EvtDeviceD0Exit = Exit;
     p.EvtDeviceQueryStop = QueryStop; p.EvtDeviceQueryRemove = QueryRemove;
     WdfDeviceInitSetPnpPowerEventCallbacks(init, &p);
+    {
+        UCHAR minor = IRP_MN_QUERY_DEVICE_RELATIONS;
+        s = WdfDeviceInitAssignWdmIrpPreprocessCallback(init, V3dPowerRelations, IRP_MJ_PNP, &minor, 1);
+        if (!NT_SUCCESS(s)) return s;
+    }
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&a, V3D_CONTEXT); a.ExecutionLevel = WdfExecutionLevelPassive;
     s = WdfDeviceCreate(&init, &a, &device); if (!NT_SUCCESS(s)) return s;
     c = Context(device); c->Device = device;
@@ -1062,7 +1217,15 @@ VOID Control(WDFQUEUE queue, WDFREQUEST request, size_t ol, size_t il, ULONG cod
     if (code == IOCTL_PI5_V3D_QUERY) {
         if (il || ol != sizeof(*out)) { s = STATUS_INVALID_PARAMETER; goto Done; }
         s = WdfRequestRetrieveOutputBuffer(request, sizeof(*out), (PVOID *)&out, NULL);
-        if (s == STATUS_SUCCESS) { Snapshot(c); *out = c->Status; used = sizeof(*out); }
+        if (s == STATUS_SUCCESS) {
+            if (c->Claimed && !BootFault) {
+                NTSTATUS checked;
+                c->GuardsClean = FALSE;
+                checked = Guards(c);
+                if (checked != STATUS_SUCCESS) (void)Fault(c, checked);
+            }
+            Snapshot(c); *out = c->Status; used = sizeof(*out);
+        }
         goto Done;
     }
     if (code == IOCTL_PI5_V3D_COMPUTE_QUERY) {
@@ -1086,6 +1249,34 @@ VOID Control(WDFQUEUE queue, WDFREQUEST request, size_t ol, size_t il, ULONG cod
     if (WdfRequestGetRequestorMode(request) != KernelMode) { s = STATUS_ACCESS_DENIED; goto Done; }
     if (!file || !c->Status.Online) { s = STATUS_DEVICE_NOT_READY; goto Done; }
     if (BootFault) { s = STATUS_DEVICE_HARDWARE_ERROR; goto Done; }
+#if DBG
+    if (code == IOCTL_PI5_V3D_PROFILE) {
+        PI5_V3D_PROFILE *profile, *result;
+        ULONG mode;
+        if (c->Owner != file || !c->MemorySession) { s=STATUS_ACCESS_DENIED; goto Done; }
+        if (il!=sizeof(*profile)||ol!=sizeof(*profile)) { s=STATUS_INVALID_PARAMETER; goto Done; }
+        s=WdfRequestRetrieveInputBuffer(request,il,(PVOID *)&profile,NULL);if(s!=STATUS_SUCCESS)goto Done;
+        if(profile->Version!=1||profile->Mode>2||profile->Reserved||profile->Overflow) { s=STATUS_INVALID_PARAMETER; goto Done; }
+        mode=profile->Mode;
+        s=WdfRequestRetrieveOutputBuffer(request,ol,(PVOID *)&result,NULL);if(s!=STATUS_SUCCESS)goto Done;
+        if(mode<2){c->ProfileEnabled=mode!=0;RtlZeroMemory(&c->Profile,sizeof(c->Profile));}
+        *result=c->Profile;result->Version=1;result->Mode=mode;used=sizeof(*result);goto Done;
+    }
+    if(code==IOCTL_PI5_V3D_MEMORY_BEGIN)c->ProfileEnabled=FALSE;
+#endif
+    if (code == IOCTL_PI5_V3D_BUFFER_IMPORT) {
+        PI5_V3D_BUFFER_IMPORT input;
+        PVOID buffer;
+        PI5_V3D_BUFFER *result;
+        if (c->Owner != file || !c->MemorySession) { s = STATUS_ACCESS_DENIED; goto Done; }
+        if (il != sizeof(input) || ol != sizeof(*result)) { s = STATUS_INVALID_PARAMETER; goto Done; }
+        s = WdfRequestRetrieveInputBuffer(request, il, &buffer, NULL); if (s != STATUS_SUCCESS) goto Done;
+        input = *(PI5_V3D_BUFFER_IMPORT *)buffer;
+        s = WdfRequestRetrieveOutputBuffer(request, ol, (PVOID *)&result, NULL); if (s != STATUS_SUCCESS) goto Done;
+        if (input.Version != 1) { s = STATUS_INVALID_PARAMETER; goto Done; }
+        s = ObjectImport(c, &input, result); if (s == STATUS_SUCCESS) used = ol;
+        c->Status.LastStatus = (ULONG)s; goto Done;
+    }
     if (code == IOCTL_PI5_V3D_SUBMIT_CL) {
         PI5_V3D_SUBMIT_CL *cl, *result;
         if (c->Owner != file || !c->MemorySession) { s = STATUS_ACCESS_DENIED; goto Done; }
@@ -1094,6 +1285,16 @@ VOID Control(WDFQUEUE queue, WDFREQUEST request, size_t ol, size_t il, ULONG cod
         s = WdfRequestRetrieveOutputBuffer(request, ol, (PVOID *)&result, NULL); if (s != STATUS_SUCCESS) goto Done;
         if (cl->Version != 1) { s = STATUS_INVALID_PARAMETER; goto Done; }
         s = ObjectSubmit(c, cl, result); if (s == STATUS_SUCCESS) used = ol;
+        c->Status.LastStatus = (ULONG)s; goto Done;
+    }
+    if (code == IOCTL_PI5_V3D_BUFFER_TILE) {
+        PI5_V3D_BUFFER_TILE *tile, *result;
+        if (c->Owner != file || !c->MemorySession) { s = STATUS_ACCESS_DENIED; goto Done; }
+        if (il != sizeof(*tile) || ol != sizeof(*tile)) { s = STATUS_INVALID_PARAMETER; goto Done; }
+        s = WdfRequestRetrieveInputBuffer(request, il, (PVOID *)&tile, NULL); if (s != STATUS_SUCCESS) goto Done;
+        s = WdfRequestRetrieveOutputBuffer(request, ol, (PVOID *)&result, NULL); if (s != STATUS_SUCCESS) goto Done;
+        if (tile->Version != 1) { s = STATUS_INVALID_PARAMETER; goto Done; }
+        s = ObjectTile(c, tile, result); if (s == STATUS_SUCCESS) used = ol;
         c->Status.LastStatus = (ULONG)s; goto Done;
     }
     if (code == IOCTL_PI5_V3D_BUFFER_COPY) {

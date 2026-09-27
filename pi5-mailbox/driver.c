@@ -13,6 +13,11 @@ static const GUID MailboxUuid = {0xa95b0d30,0x818e,0x4a96,{0xa4,0x7b,0x72,0x6d,0
  * second instance/restart within the same loaded driver, even on that path. */
 static volatile LONG BootClaim;
 typedef struct {
+    WDFFILEOBJECT Owner;
+    ULONG BaselineRate, BaselineState;
+    BOOLEAN Abandoned;
+} CLOCK_LEASE;
+typedef struct {
     WDFDEVICE Device;
     WDFWAITLOCK Lock;
     PUCHAR Registers;
@@ -24,9 +29,7 @@ typedef struct {
     PI5_MAILBOX_STATS Stats;
     volatile LONG RejectedRestarts;
     BOOLEAN Pinned;
-    WDFFILEOBJECT ClockOwner;
-    ULONG ClockBaselineRate, ClockBaselineState;
-    BOOLEAN ClockAbandoned;
+    CLOCK_LEASE Clocks[2]; /* ARM rate, V3D rate/state. */
 } DEVICE_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, Context)
 
@@ -194,7 +197,7 @@ static NTSTATUS Transfer(DEVICE_CONTEXT *c, ULONG tag, uint32_t *data, ULONG byt
     case MbxFirmwareError: status = STATUS_IO_DEVICE_ERROR; break;
     default: status = STATUS_DEVICE_PROTOCOL_ERROR; break;
     }
-    if (NT_SUCCESS(status) && bytes >= 8 && data[0] != id) {
+    if (NT_SUCCESS(status) && bytes >= 8 && !MbxReplyIdMatches(tag, id, data[0])) {
         c->Transport.Fault = 1; ++c->Transport.Failures;
         status = STATUS_DEVICE_PROTOCOL_ERROR;
     }
@@ -459,42 +462,55 @@ _Use_decl_annotations_
 void ClockCleanup(WDFFILEOBJECT file)
 {
     DEVICE_CONTEXT *c = Context(WdfFileObjectGetDevice(file));
+    ULONG i;
     (void)WdfWaitLockAcquire(c->Lock, NULL);
-    if (c->ClockOwner == file) {
+    for (i = 0; i < RTL_NUMBER_OF(c->Clocks); ++i) if (c->Clocks[i].Owner == file) {
         /* The provider must explicitly release only after restoring baseline.
          * Never transfer an uncertain clock to a second controller. This is
          * separate from a mailbox transport fault so RTC service can continue. */
-        c->ClockOwner = NULL;
-        c->ClockAbandoned = TRUE;
+        c->Clocks[i].Owner = NULL;
+        c->Clocks[i].Abandoned = TRUE;
     }
     WdfWaitLockRelease(c->Lock);
+}
+
+static BOOLEAN ClockRequestValid(const PI5_MAILBOX_CLOCK_CONTROL *q)
+{
+    return q->Version == PI5_MAILBOX_VERSION && (q->Id == 3 || q->Id == 5) &&
+        q->Operation >= Pi5MailboxClockClaim && q->Operation <= Pi5MailboxClockSetState &&
+        !(q->Operation <= Pi5MailboxClockRelease && q->Value) &&
+        !(q->Operation == Pi5MailboxClockSetState && (q->Id != 5 || q->Value > 1)) &&
+        !(q->Operation == Pi5MailboxClockSetRate && !q->Value);
 }
 
 static NTSTATUS ClockControlLocked(DEVICE_CONTEXT *c, WDFFILEOBJECT file,
     const PI5_MAILBOX_CLOCK_CONTROL *q, PI5_MAILBOX_RESULT *r)
 {
-    uint32_t rate[2] = {5,0}, state[2] = {5,0}, data[3] = {5,0,0};
-    uint32_t minimum[2] = {5,0}, maximum[2] = {5,0};
+    uint32_t rate[2] = {q->Id,0}, state[2] = {q->Id,0}, data[3] = {q->Id,0,0};
+    uint32_t minimum[2] = {q->Id,0}, maximum[2] = {q->Id,0};
+    CLOCK_LEASE *clock;
     NTSTATUS status;
+    if (!ClockRequestValid(q)) return STATUS_INVALID_PARAMETER;
+    clock = &c->Clocks[q->Id == 3 ? 0 : 1];
     if (!c->Stats.Online || !c->Stats.Owned) return STATUS_DEVICE_NOT_READY;
-    if (c->ClockAbandoned) return STATUS_DEVICE_HARDWARE_ERROR;
+    if (clock->Abandoned) return STATUS_DEVICE_HARDWARE_ERROR;
     if (q->Operation == Pi5MailboxClockClaim) {
-        if (c->ClockOwner) return STATUS_DEVICE_BUSY;
+        if (clock->Owner) return STATUS_DEVICE_BUSY;
         status = Transfer(c, 0x30002, rate, sizeof(rate));
-        if (NT_SUCCESS(status)) status = Transfer(c, 0x30001, state, sizeof(state));
+        if (NT_SUCCESS(status) && q->Id == 5) status = Transfer(c, 0x30001, state, sizeof(state));
         if (!NT_SUCCESS(status)) return status;
         if (!rate[1] || state[1] > 1) return STATUS_DEVICE_CONFIGURATION_ERROR;
-        c->ClockBaselineRate = rate[1]; c->ClockBaselineState = state[1];
-        c->ClockOwner = file;
+        clock->BaselineRate = rate[1]; clock->BaselineState = state[1];
+        clock->Owner = file;
     } else {
-        if (c->ClockOwner != file) return STATUS_ACCESS_DENIED;
+        if (clock->Owner != file) return STATUS_ACCESS_DENIED;
         if (q->Operation == Pi5MailboxClockRelease) {
             status = Transfer(c, 0x30002, rate, sizeof(rate));
-            if (NT_SUCCESS(status)) status = Transfer(c, 0x30001, state, sizeof(state));
+            if (NT_SUCCESS(status) && q->Id == 5) status = Transfer(c, 0x30001, state, sizeof(state));
             if (!NT_SUCCESS(status)) return status;
-            if (rate[1] != c->ClockBaselineRate || state[1] != c->ClockBaselineState)
+            if (rate[1] != clock->BaselineRate || state[1] != clock->BaselineState)
                 return STATUS_DEVICE_BUSY;
-            c->ClockOwner = NULL;
+            clock->Owner = NULL;
         } else {
             data[1] = q->Value;
             if (q->Operation == Pi5MailboxClockSetRate) {
@@ -511,7 +527,7 @@ static NTSTATUS ClockControlLocked(DEVICE_CONTEXT *c, WDFFILEOBJECT file,
         }
     }
     r->Version = PI5_MAILBOX_VERSION; r->Operation = q->Operation;
-    r->Id = 5; r->Value = data[1];
+    r->Id = q->Id; r->Value = data[1];
     return STATUS_SUCCESS;
 }
 
@@ -530,11 +546,7 @@ static void ClockControl(DEVICE_CONTEXT *c, WDFREQUEST request, size_t outputLen
     status = WdfRequestRetrieveInputBuffer(request, sizeof(q), (PVOID *)&input, NULL);
     if (!NT_SUCCESS(status)) { WdfRequestComplete(request, status); return; }
     q = *input;
-    if (q.Version != PI5_MAILBOX_VERSION || q.Id != 5 ||
-        q.Operation < Pi5MailboxClockClaim || q.Operation > Pi5MailboxClockSetState ||
-        (q.Operation <= Pi5MailboxClockRelease && q.Value) ||
-        (q.Operation == Pi5MailboxClockSetState && q.Value > 1) ||
-        (q.Operation == Pi5MailboxClockSetRate && !q.Value)) {
+    if (!ClockRequestValid(&q)) {
         WdfRequestComplete(request, STATUS_INVALID_PARAMETER); return;
     }
     status = WdfRequestRetrieveOutputBuffer(request, sizeof(*output), (PVOID *)&output, NULL);
@@ -543,6 +555,54 @@ static void ClockControl(DEVICE_CONTEXT *c, WDFREQUEST request, size_t outputLen
     if (!NT_SUCCESS(status)) { WdfRequestComplete(request, status); return; }
     status = ClockControlLocked(c, file, &q, output);
     WdfWaitLockRelease(c->Lock);
+    WdfRequestCompleteWithInformation(request, status, NT_SUCCESS(status) ? sizeof(*output) : 0);
+}
+
+static void DisplayQuery(DEVICE_CONTEXT *c, WDFREQUEST request, size_t outputLength, size_t inputLength)
+{
+    PI5_MAILBOX_DISPLAY_QUERY q, *input;
+    PI5_MAILBOX_DISPLAY_RESULT *output;
+    union {
+        struct { uint32_t Block, Display; uint8_t Data[128]; } Edid;
+        PI5_MAILBOX_DISPLAY_TIMING Timing;
+        uint32_t Words[34];
+    } payload;
+    ULONG tag, bytes;
+    NTSTATUS status;
+    C_ASSERT(sizeof(PI5_MAILBOX_DISPLAY_TIMING) == 36);
+    if (inputLength != sizeof(q) || outputLength < sizeof(*output)) {
+        WdfRequestComplete(request, STATUS_INVALID_BUFFER_SIZE); return;
+    }
+    status = WdfRequestRetrieveInputBuffer(request, sizeof(q), (PVOID *)&input, NULL);
+    if (!NT_SUCCESS(status)) { WdfRequestComplete(request, status); return; }
+    q = *input;
+    if (q.Version != PI5_MAILBOX_VERSION || q.Port > 1 || q.Block > 255 ||
+        (q.Operation != Pi5MailboxDisplayEdid && q.Operation != Pi5MailboxDisplayTiming) ||
+        (q.Operation == Pi5MailboxDisplayTiming && q.Block)) {
+        WdfRequestComplete(request, STATUS_INVALID_PARAMETER); return;
+    }
+    status = WdfRequestRetrieveOutputBuffer(request, sizeof(*output), (PVOID *)&output, NULL);
+    if (!NT_SUCCESS(status)) { WdfRequestComplete(request, status); return; }
+    RtlZeroMemory(&payload, sizeof(payload));
+    if (q.Operation == Pi5MailboxDisplayEdid) {
+        payload.Edid.Block = q.Block; payload.Edid.Display = q.Port ? 7 : 2;
+        tag = 0x30023; bytes = sizeof(payload.Edid);
+    } else {
+        payload.Timing.Display = (uint8_t)(q.Port ? 7 : 2);
+        tag = 0x40017; bytes = sizeof(payload.Timing);
+    }
+    status = Lock(c);
+    if (!NT_SUCCESS(status)) { WdfRequestComplete(request, status); return; }
+    status = Transfer(c, tag, payload.Words, bytes);
+    WdfWaitLockRelease(c->Lock);
+    if (NT_SUCCESS(status)) {
+        RtlZeroMemory(output, sizeof(*output));
+        output->Version = q.Version; output->Operation = q.Operation;
+        output->Port = q.Port; output->Block = q.Block;
+        if (q.Operation == Pi5MailboxDisplayEdid)
+            RtlCopyMemory(output->Data.Edid, payload.Edid.Data, sizeof(output->Data.Edid));
+        else output->Data.Timing = payload.Timing;
+    }
     WdfRequestCompleteWithInformation(request, status, NT_SUCCESS(status) ? sizeof(*output) : 0);
 }
 
@@ -557,6 +617,9 @@ void Control(WDFQUEUE queue, WDFREQUEST request, size_t outputLength, size_t inp
     ULONG tag = 0, bytes = 8;
     size_t used = 0;
     NTSTATUS status;
+    if (code == IOCTL_PI5_MAILBOX_DISPLAY_QUERY) {
+        DisplayQuery(c, request, outputLength, inputLength); return;
+    }
     if (code == IOCTL_PI5_MAILBOX_CLOCK_CONTROL) {
         ClockControl(c, request, outputLength, inputLength); return;
     }
@@ -579,6 +642,7 @@ void Control(WDFQUEUE queue, WDFREQUEST request, size_t outputLength, size_t inp
         case Pi5MailboxClockState: if (query.Id && query.Id <= 16) tag = 0x30001; break;
         case Pi5MailboxClockMinRate: if (query.Id && query.Id <= 16) tag = 0x30007; break;
         case Pi5MailboxClockMaxRate: if (query.Id && query.Id <= 16) tag = 0x30004; break;
+        case Pi5MailboxClockMeasuredRate: if (query.Id && query.Id <= 16) tag = 0x30047; break;
         case Pi5MailboxRtcSeconds: if (!query.Id) tag = 0x30087; break;
         default: break;
         }

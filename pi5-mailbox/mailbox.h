@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define MBX_BUFFER_BYTES 64u
+#define MBX_BUFFER_BYTES 256u
 #define MBX_TIMEOUT_100NS 30000000ull
 typedef enum {
     MbxOk, MbxInvalid, MbxTimeout, MbxForeignReply, MbxMalformed,
@@ -28,6 +28,7 @@ typedef struct {
 /* Caller owns serialization and a HAL common buffer. A submitted buffer may
  * only be reused/freed after the matching reply. Fault is sticky until reboot. */
 MBX_RESULT MbxTransfer(MBX_TRANSPORT *t, uint32_t tag, uint32_t *data, uint32_t bytes);
+int MbxReplyIdMatches(uint32_t tag, uint32_t requested, uint32_t returned);
 int MbxEncodeAddress(uint64_t logical, uint64_t physical, uint32_t bytes, uint32_t *encoded);
 int MbxTimeToEpoch(const uint8_t time[16], uint32_t *epoch);
 void MbxEpochToTime(uint32_t epoch, uint8_t time[16]);

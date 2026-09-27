@@ -1,18 +1,10 @@
-# BCM2712 multimedia IOMMU provider
+# BCM2712 multimedia IOMMU
 
-Owns the MMU0 ACPI resources for the BCM2712 multimedia IOMMUs and their shared
-translation cache. Kernel clients use IOMMU4 page tables backed by
-HAL-allocated common buffers, with invalid guard pages, access permissions,
-serialized cache invalidation, and explicit buffer/session lifetimes.
-Translation is enabled only inside a synchronous DMA window whose client
-verifies ownership and drains its hardware before returning. Outside that
-window, buffers remain staged with translation disabled. Clients can retire
-an IOVA while keeping its backing allocation. Register snapshots are available
-to administrators. Device faults, uncertain stops or invalidation, and damaged
-buffer guards quarantine the allocations until reboot.
+`Pi5Iommu.sys` manages the BCM2712 multimedia IOMMUs and their shared
+translation cache. It provides guarded DMA buffers, permission-controlled
+mappings and bounded DMA windows to kernel clients. Its translation resources
+are separate from the V3D GPU's internal MMU.
 
-The interface is defined in [pi5-iommu.h](../common/pi5-iommu.h). It depends on
-the matching Raspberry Pi 5 UEFI MMU0 resource description and its noncoherent
-DMA declaration (`_CCA=0`). A DMA consumer must own its device resources,
-retain the relevant clock and power services, and preserve other IOMMU4
-clients using the below-40-GiB bypass range.
+It requires matching firmware exposing the MMU0 resources and their
+noncoherent DMA contract. Consumers retain ownership of their device, clock
+and power resources while using a translation window.

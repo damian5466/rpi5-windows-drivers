@@ -89,14 +89,49 @@ void V3dSubmitCopy(const V3D_IO *io, uint32_t width, uint32_t height)
 
 void V3dSubmitCopyAt(const V3D_IO *io, uint32_t width, uint32_t height, uint32_t source, uint32_t destination)
 {
+    V3dSubmitTransferAt(io, width, height, source, destination, width, width << 16);
+}
+
+int V3dTextureLayout(uint32_t width, uint32_t height, uint32_t pitch, uint32_t layout,
+                     uint32_t rows, uint32_t *sourceBytes, uint32_t *destinationBytes,
+                     uint32_t *outputConfig)
+{
+    uint32_t w, h;
+    if (!width || width > 4096 || !height || height > 4096 ||
+        pitch < width * 4 || pitch > 16384 || (pitch & 3) ||
+        !sourceBytes || !destinationBytes || !outputConfig) return V3dInvalid;
+    switch (layout) {
+    case 3:
+        if (rows || (width > 4 && height > 4)) return V3dInvalid;
+        w = (width + 3) & ~3u; h = (height + 3) & ~3u; break;
+    case 4:
+    case 5:
+        w = layout == 4 ? 8 : 16;
+        if (rows || width > w) return V3dInvalid;
+        h = (height + 7) & ~7u; break;
+    case 6:
+    case 7:
+        if (rows < (height + 7) / 8 || rows > 512 || (layout == 7 && (rows & 31)))
+            return V3dInvalid;
+        w = (width + 31) & ~31u; h = rows * 8; break;
+    default: return V3dInvalid;
+    }
+    *sourceBytes = pitch * height; *destinationBytes = w * h * 4;
+    *outputConfig = (layout << 12) | (rows << 16);
+    return V3dOk;
+}
+
+void V3dSubmitTransferAt(const V3D_IO *io, uint32_t width, uint32_t height, uint32_t source,
+                         uint32_t destination, uint32_t sourceStride, uint32_t outputConfig)
+{
     /* V3D 7.1 supports raster output. R32F (29) is the unfiltered generic
      * 32-bit copy format; pitches are in pixels, dimensions are literal. */
     io->Write(io->Context, V3dHub, 0x704, 0);
     io->Write(io->Context, V3dHub, 0x70c, source);
     io->Write(io->Context, V3dHub, 0x710, 0);
-    io->Write(io->Context, V3dHub, 0x714, width);
+    io->Write(io->Context, V3dHub, 0x714, sourceStride);
     io->Write(io->Context, V3dHub, 0x718, 0);
-    io->Write(io->Context, V3dHub, 0x71c, width << 16);
+    io->Write(io->Context, V3dHub, 0x71c, outputConfig);
     io->Write(io->Context, V3dHub, 0x720, destination);
     io->Write(io->Context, V3dHub, 0x724, (height << 16) | width);
     io->Write(io->Context, V3dHub, 0x728, 0);

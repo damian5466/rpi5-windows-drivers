@@ -66,6 +66,11 @@ int V3dMmuStart(const V3D_IO *, uint64_t table, uint64_t trap);
 uint32_t V3dPte(uint64_t address, uint32_t writable);
 void V3dSubmitCopy(const V3D_IO *, uint32_t width, uint32_t height);
 void V3dSubmitCopyAt(const V3D_IO *, uint32_t width, uint32_t height, uint32_t source, uint32_t destination);
+int V3dTextureLayout(uint32_t width, uint32_t height, uint32_t pitch, uint32_t layout,
+                     uint32_t rows, uint32_t *sourceBytes, uint32_t *destinationBytes,
+                     uint32_t *outputConfig);
+void V3dSubmitTransferAt(const V3D_IO *, uint32_t width, uint32_t height, uint32_t source,
+                         uint32_t destination, uint32_t sourceStride, uint32_t outputConfig);
 int V3dInvalidate(const V3D_IO *);
 void V3dSubmitCompute(const V3D_IO *, uint32_t revision);
 /* Writes at most 128 bytes. Returns zero without changing output for invalid

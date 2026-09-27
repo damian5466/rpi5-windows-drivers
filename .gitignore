@@ -2,6 +2,7 @@ Build/
 __pycache__/
 *.pyc
 *.sys
+*.dll
 *.cat
 *.pdb
 *.obj
@@ -10,5 +11,6 @@ __pycache__/
 *.pfx
 *.p12
 *.fd
+*.zip
 RPI_NV?.bin
 .DS_Store

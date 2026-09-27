@@ -24,6 +24,17 @@
 #define IOCTL_PI5_V3D_BUFFER_READ CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8af, METHOD_BUFFERED, FILE_WRITE_DATA)
 #define IOCTL_PI5_V3D_BUFFER_COPY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8b0, METHOD_BUFFERED, FILE_WRITE_DATA)
 #define IOCTL_PI5_V3D_SUBMIT_CL CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8b1, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_PI5_V3D_BUFFER_IMPORT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8b2, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_PI5_V3D_BUFFER_TILE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8b3, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_PI5_V3D_PROFILE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8b4, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define PI5_V3D_PROFILE_COUNTERS 32u
+/* DEBUG, kernel session owner only: Mode 0 disables, 1 enables collection for
+ * subsequent command lists, 2 reads the latest completed list. Fixed V3D7.1
+ * counter sources; no caller-selected registers. Overflow marks invalid data. */
+typedef struct {
+    uint32_t Version,Mode,Overflow,Reserved;
+    uint32_t Counters[PI5_V3D_PROFILE_COUNTERS];
+} PI5_V3D_PROFILE;
 #define PI5_V3D_COMPUTE_LANES 16u
 #define PI5_V3D_XOR_ADD 0u
 #define PI5_V3D_XOR_SUB 1u
@@ -94,11 +105,13 @@ typedef struct {
 #define PI5_V3D_BUFFER_LIMIT 256u
 #define PI5_V3D_BUFFER_MAX_BYTES (64u * 1024u * 1024u)
 #define PI5_V3D_MEMORY_MAX_BYTES (256u * 1024u * 1024u)
+#define PI5_V3D_IMPORT_MAX_BYTES (256u * 1024u * 1024u)
+#define PI5_V3D_IMPORT_TOTAL_BYTES (512u * 1024u * 1024u)
 #define PI5_V3D_TRANSFER_MAX_BYTES 65536u
 
 /* MEMORY_BEGIN selects a kernel-only buffer session instead of the fixed
  * command session. Addresses are assigned by the provider; callers never
- * supply physical pages or CPU pointers. CREATE takes zero Handle/Address;
+ * supply GPU addresses. CREATE takes zero Handle/Address;
  * DESTROY takes only Version/Handle. READ takes this transfer header and
  * returns the header followed by Bytes data; WRITE takes header plus data.
  * Transfers are aligned 32-bit words, at most 64 KiB per request. Handles
@@ -110,10 +123,31 @@ typedef struct {
 typedef struct {
     uint32_t Version, Handle, Offset, Bytes;
 } PI5_V3D_TRANSFER;
+/* Trusted kernel consumer only. Mdl is a kernel PMDL describing page-aligned,
+ * locked/nonpaged RAM. The provider assigns guarded GPU virtual space and
+ * returns PI5_V3D_BUFFER. The caller retains the MDL and backing memory until
+ * DESTROY or END succeeds; an uncertain GPU retirement retains both. Imported
+ * pages are never freed or mapped to a CPU alias by this provider. READ/WRITE
+ * do not accept imported buffers. This call must not be forwarded from user mode. */
+typedef struct {
+    uint32_t Version, Flags, Reserved[2];
+    uint64_t Mdl;
+} PI5_V3D_BUFFER_IMPORT;
 typedef struct {
     uint32_t Version, Source, Destination, Width, Height, SourceOffset, DestinationOffset, Reserved;
     uint64_t Fence;
 } PI5_V3D_BUFFER_COPY;
+/* Kernel-only 32-bit raster-to-tiled copy. SourcePitch is in bytes; offsets
+ * are 64-byte aligned. Layout selects linear utiles (3), one/two UIF-block
+ * columns (4/5), or UIF without/with XOR (6/7). OutputRows is the padded
+ * height in 8-pixel blocks for UIF and zero otherwise. No filtering, format
+ * conversion or mip generation. The provider checks both buffer extents and
+ * rejects overlapping ranges; completion has the BUFFER_COPY fence rules. */
+typedef struct {
+    uint32_t Version, Source, Destination, SourceOffset, DestinationOffset;
+    uint32_t Width, Height, SourcePitch, Layout, OutputRows;
+    uint64_t Fence;
+} PI5_V3D_BUFFER_TILE;
 
 /* Trusted kernel consumer only, inside MEMORY_BEGIN. Command lists must be
  * wholly inside GPU read-only objects; tile storage must be writable. All

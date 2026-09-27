@@ -1,7 +1,8 @@
-# Pi 5 V3D reset gate provider
+# BCM2712 V3D reset gate
 
-`Pi5Pm` owns the BCM2712 PM00 register resource and provides a leased V3D
-reset gate at PM+0x304. It leaves the legacy GRAFX register untouched. A V3D
-consumer also depends on `Pi5Fclk` for firmware clock 5 and must hold the
-clock while using the reset gate. V3D 7.1 SMS power management belongs to
-the GPU consumer.
+`Pi5Pm.sys` provides exclusive leases for the BCM2712 V3D reset gate. It leaves
+the legacy GRAFX power register untouched; GPU-local power management belongs
+to the GPU consumer.
+
+It requires matching firmware exposing the PM00 resources. Consumers must
+also retain a V3D clock lease from [pi5-fclk](../pi5-fclk/README.md).

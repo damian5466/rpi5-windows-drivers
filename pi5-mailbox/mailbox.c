@@ -18,6 +18,17 @@ static MBX_RESULT Fail(MBX_TRANSPORT *t, MBX_RESULT result, int fatal)
     return result;
 }
 
+int MbxReplyIdMatches(uint32_t tag, uint32_t requested, uint32_t returned)
+{
+    /* BCM2712 measured-clock replies contain the measured rate but clear the
+     * selector. Accept that exact encoding only for this read-only tag; all
+     * other property replies must echo the requested selector. */
+    /* GET_DISPLAY_TIMING fills the VIC in the upper half of this word. */
+    return returned == requested || (tag == 0x40017u &&
+        (requested == 2 || requested == 7) && (returned & 255u) == requested) || (tag == 0x30047u && requested &&
+        requested <= 16 && returned == 0);
+}
+
 int MbxEncodeAddress(uint64_t logical, uint64_t physical, uint32_t bytes, uint32_t *encoded)
 {
     if (!bytes || bytes > 0x40000000u || (logical & 15) || (physical & 15) ||
@@ -81,7 +92,10 @@ MBX_RESULT MbxTransfer(MBX_TRANSPORT *t, uint32_t tag, uint32_t *data, uint32_t 
     if (t->Buffer[1] != 0x80000000u ||
         (t->Buffer[4] != (0x80000000u | bytes) &&
          !((tag == 0x30087u || tag == 0x38087u) && bytes == 8 && t->Buffer[4] == 0x80000004u) &&
-         !(tag == 0x38002u && bytes == 12 && t->Buffer[4] == 0x80000008u)))
+         !(tag == 0x38002u && bytes == 12 && t->Buffer[4] == 0x80000008u) &&
+         /* Display timing/selection setters have no reply data used by the
+          * caller. BCM2712 may leave their per-tag request length at zero. */
+         !(((tag == 0x48017u && bytes == 36) || (tag == 0x48013u && bytes == 4)) && t->Buffer[4] == 0)))
         return Fail(t, MbxMalformed, 1);
     for (i = 0; i < bytes / 4; ++i) data[i] = t->Buffer[5 + i];
     return MbxOk;

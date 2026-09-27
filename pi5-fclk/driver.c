@@ -3,13 +3,15 @@
 #include <wdf.h>
 #include "pi5-mailbox.h"
 #include "pi5-fclk.h"
+#include "pi5-power-relations.h"
 
-#define FCLK_IDS 5u
+#define FCLK_IDS 6u
 #define FCLK_MAILBOX_TIMEOUT_SEC 30u
 typedef struct {
     WDFDEVICE Device;
     WDFWAITLOCK Lock;
     WDFIOTARGET Mailbox;
+    WDFTIMER ArmTimer;
     ULONG Users[FCLK_IDS];
     ULONG BaselineRate, BaselineState;
     ULONG StateVote;
@@ -17,6 +19,8 @@ typedef struct {
     ULONG LastControlOperation, LastControlRequested, LastControlReply;
     ULONG LastControlStatus, LastObservedState, LastObservedStatus;
     BOOLEAN Online, Claimed, Changed, Uncertain, Pinned, StateVoteValid;
+    ULONG ArmBaseline, ArmRate, ArmStatus, ArmAttempts;
+    BOOLEAN ArmClaimed, ArmChanged, ArmReady, ArmUncertain;
 } FCLK_CONTEXT;
 typedef struct { ULONG Held; } FCLK_FILE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FCLK_CONTEXT, FclkContext)
@@ -32,9 +36,29 @@ EVT_WDF_DEVICE_QUERY_REMOVE FclkQueryRemove;
 EVT_WDF_IO_TARGET_QUERY_REMOVE FclkMailboxQueryRemove;
 EVT_WDF_FILE_CLEANUP FclkCleanup;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL FclkIo;
+EVT_WDF_TIMER FclkArmTimer;
+EVT_WDFDEVICE_WDM_IRP_PREPROCESS FclkPowerRelations;
+
+_Use_decl_annotations_
+NTSTATUS FclkPowerRelations(WDFDEVICE device, PIRP irp)
+{
+    FCLK_CONTEXT *c = FclkContext(device);
+    NTSTATUS status;
+    if (IoGetCurrentIrpStackLocation(irp)->Parameters.QueryDeviceRelations.Type == PowerRelations) {
+        WdfWaitLockAcquire(c->Lock, NULL);
+        status = Pi5AppendPowerRelations(irp, &c->Mailbox, 1);
+        WdfWaitLockRelease(c->Lock);
+        if (!NT_SUCCESS(status)) {
+            irp->IoStatus.Status = status; IoCompleteRequest(irp, IO_NO_INCREMENT); return status;
+        }
+    }
+    IoSkipCurrentIrpStackLocation(irp);
+    return WdfDeviceWdmDispatchPreprocessedIrp(device, irp);
+}
 
 static const ULONG Ids[FCLK_IDS] = {
-    PI5_FCLK_CORE, PI5_FCLK_V3D, PI5_FCLK_M2MC, PI5_FCLK_PIXEL_BVB, PI5_FCLK_DISP
+    PI5_FCLK_CORE, PI5_FCLK_V3D, PI5_FCLK_M2MC, PI5_FCLK_PIXEL_BVB, PI5_FCLK_DISP,
+    PI5_FCLK_ARM
 };
 
 static LONG Index(ULONG id)
@@ -47,7 +71,7 @@ static LONG Index(ULONG id)
 static BOOLEAN Busy(FCLK_CONTEXT *c)
 {
     ULONG i;
-    if (c->Uncertain || c->Claimed) return TRUE;
+    if (c->Uncertain || c->Claimed || c->ArmUncertain) return TRUE;
     for (i = 0; i < FCLK_IDS; ++i) if (c->Users[i]) return TRUE;
     return FALSE;
 }
@@ -80,6 +104,11 @@ static VOID Diagnostic(WDFDEVICE device, FCLK_CONTEXT *c)
     DECLARE_CONST_UNICODE_STRING(controlStatus, L"FclkLastControlStatus");
     DECLARE_CONST_UNICODE_STRING(observed, L"FclkLastObservedState");
     DECLARE_CONST_UNICODE_STRING(observedStatus, L"FclkLastObservedStatus");
+    DECLARE_CONST_UNICODE_STRING(armStatus, L"FclkArmStatus");
+    DECLARE_CONST_UNICODE_STRING(armBaseline, L"FclkArmBaselineHz");
+    DECLARE_CONST_UNICODE_STRING(armRate, L"FclkArmRequestedHz");
+    DECLARE_CONST_UNICODE_STRING(armReady, L"FclkArmReady");
+    DECLARE_CONST_UNICODE_STRING(armUncertain, L"FclkArmUncertain");
     if (NT_SUCCESS(WdfDeviceOpenRegistryKey(device, PLUGPLAY_REGKEY_DEVICE,
         KEY_SET_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &key))) {
         (void)WdfRegistryAssignULong(key, &debug, DBG);
@@ -91,6 +120,11 @@ static VOID Diagnostic(WDFDEVICE device, FCLK_CONTEXT *c)
         (void)WdfRegistryAssignULong(key, &controlStatus, c->LastControlStatus);
         (void)WdfRegistryAssignULong(key, &observed, c->LastObservedState);
         (void)WdfRegistryAssignULong(key, &observedStatus, c->LastObservedStatus);
+        (void)WdfRegistryAssignULong(key, &armStatus, c->ArmStatus);
+        (void)WdfRegistryAssignULong(key, &armBaseline, c->ArmBaseline);
+        (void)WdfRegistryAssignULong(key, &armRate, c->ArmRate);
+        (void)WdfRegistryAssignULong(key, &armReady, c->ArmReady);
+        (void)WdfRegistryAssignULong(key, &armUncertain, c->ArmUncertain);
         WdfRegistryClose(key);
     }
 }
@@ -129,6 +163,7 @@ static NTSTATUS OpenMailbox(FCLK_CONTEXT *c)
     open.EvtIoTargetQueryRemove = FclkMailboxQueryRemove;
     status = WdfIoTargetOpen(c->Mailbox, &open);
     if (!NT_SUCCESS(status)) { WdfObjectDelete(c->Mailbox); c->Mailbox = NULL; }
+    else IoInvalidateDeviceRelations(WdfDeviceWdmGetPhysicalDevice(c->Device), PowerRelations);
     return status;
 }
 
@@ -200,6 +235,103 @@ static NTSTATUS State(FCLK_CONTEXT *c, ULONG id, ULONG *state)
     NTSTATUS status = Query(c, Pi5MailboxClockState, id, state);
     if (NT_SUCCESS(status) && *state > 1u) return STATUS_DEVICE_CONFIGURATION_ERROR;
     return status;
+}
+
+/* Windows has no firmware CPU-frequency governor on this platform. Request
+ * the firmware's normal maximum while this provider is running. The firmware
+ * still owns voltage sequencing and thermal/undervoltage throttling. ARM has
+ * an independent mailbox lease and is never gated or reset here. */
+static NTSTATUS ArmControl(FCLK_CONTEXT *c, ULONG operation, ULONG value)
+{
+    PI5_MAILBOX_CLOCK_CONTROL request = { PI5_MAILBOX_VERSION, 0, PI5_FCLK_ARM, 0 };
+    PI5_MAILBOX_RESULT result = {0};
+    WDF_MEMORY_DESCRIPTOR input, output;
+    WDF_REQUEST_SEND_OPTIONS options;
+    ULONG_PTR bytes = 0;
+    NTSTATUS status;
+    request.Operation = operation; request.Value = value;
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&input, &request, sizeof(request));
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&output, &result, sizeof(result));
+    WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&options,
+        WDF_REL_TIMEOUT_IN_SEC(FCLK_MAILBOX_TIMEOUT_SEC));
+    status = WdfIoTargetSendIoctlSynchronously(c->Mailbox, NULL,
+        IOCTL_PI5_MAILBOX_CLOCK_CONTROL, &input, &output, &options, &bytes);
+    if (!NT_SUCCESS(status)) return status;
+    if (bytes != sizeof(result) || result.Version != PI5_MAILBOX_VERSION ||
+        result.Operation != operation || result.Id != PI5_FCLK_ARM)
+        return STATUS_DEVICE_PROTOCOL_ERROR;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ArmRestore(WDFDEVICE device, FCLK_CONTEXT *c)
+{
+    NTSTATUS status;
+    if (c->ArmUncertain) return STATUS_DEVICE_HARDWARE_ERROR;
+    if (!c->ArmClaimed) return STATUS_SUCCESS;
+    if (c->ArmChanged) {
+        status = ArmControl(c, Pi5MailboxClockSetRate, c->ArmBaseline);
+        if (!NT_SUCCESS(status)) goto Uncertain;
+    }
+    /* Mailbox RELEASE verifies the original requested rate before releasing. */
+    status = ArmControl(c, Pi5MailboxClockRelease, 0);
+    if (!NT_SUCCESS(status)) goto Uncertain;
+    c->ArmClaimed = FALSE; c->ArmChanged = FALSE; c->ArmReady = FALSE;
+    c->ArmRate = c->ArmBaseline;
+    return STATUS_SUCCESS;
+Uncertain:
+    c->ArmUncertain = TRUE; c->ArmStatus = (ULONG)status; Pin(device, c);
+    return status;
+}
+
+static NTSTATUS ArmStart(WDFDEVICE device, FCLK_CONTEXT *c)
+{
+    ULONG minimum = 0, maximum = 0, actual = 0;
+    NTSTATUS status, restored;
+    if (c->ArmUncertain) return STATUS_DEVICE_HARDWARE_ERROR;
+    if (c->ArmReady) return STATUS_SUCCESS;
+    status = Query(c, Pi5MailboxClockMinRate, PI5_FCLK_ARM, &minimum);
+    if (NT_SUCCESS(status)) status = Query(c, Pi5MailboxClockMaxRate, PI5_FCLK_ARM, &maximum);
+    if (!NT_SUCCESS(status)) return status;
+    if (!minimum || minimum > maximum) return STATUS_DEVICE_CONFIGURATION_ERROR;
+    status = ArmControl(c, Pi5MailboxClockClaim, 0);
+    if (!NT_SUCCESS(status)) {
+        if (status == STATUS_IO_TIMEOUT || status == STATUS_CANCELLED ||
+            status == STATUS_DEVICE_PROTOCOL_ERROR) {
+            c->ArmUncertain = TRUE; Pin(device, c);
+        }
+        return status;
+    }
+    c->ArmClaimed = TRUE;
+    status = Query(c, Pi5MailboxClockRate, PI5_FCLK_ARM, &c->ArmBaseline);
+    if (NT_SUCCESS(status) && (!c->ArmBaseline || c->ArmBaseline < minimum ||
+        c->ArmBaseline > maximum)) status = STATUS_DEVICE_CONFIGURATION_ERROR;
+    if (NT_SUCCESS(status) && c->ArmBaseline != maximum) {
+        c->ArmChanged = TRUE; /* A failed reply may follow a successful write. */
+        status = ArmControl(c, Pi5MailboxClockSetRate, maximum);
+    }
+    if (NT_SUCCESS(status)) status = Query(c, Pi5MailboxClockRate, PI5_FCLK_ARM, &actual);
+    if (NT_SUCCESS(status) && (actual < minimum || actual > maximum))
+        status = STATUS_DEVICE_PROTOCOL_ERROR;
+    if (NT_SUCCESS(status)) { c->ArmReady = TRUE; c->ArmRate = actual; return status; }
+    restored = ArmRestore(device, c);
+    return NT_SUCCESS(restored) ? status : restored;
+}
+
+_Use_decl_annotations_
+VOID FclkArmTimer(WDFTIMER timer)
+{
+    WDFDEVICE device = (WDFDEVICE)WdfTimerGetParentObject(timer);
+    FCLK_CONTEXT *c = FclkContext(device);
+    WdfWaitLockAcquire(c->Lock, NULL);
+    if (c->Online && !c->ArmReady && !c->ArmUncertain) {
+        c->ArmStatus = (ULONG)ArmStart(device, c);
+        ++c->ArmAttempts;
+        Diagnostic(device, c);
+        if (!c->ArmReady && !c->ArmUncertain && c->ArmAttempts < 30)
+            WdfTimerStart(timer, WDF_REL_TIMEOUT_IN_SEC(1));
+    }
+    WdfWaitLockRelease(c->Lock);
 }
 
 static NTSTATUS Snapshot(FCLK_CONTEXT *c, ULONG id, PI5_FCLK_STATUS *out)
@@ -334,6 +466,7 @@ NTSTATUS FclkAdd(WDFDRIVER driver, PWDFDEVICE_INIT init)
     WDF_PNPPOWER_EVENT_CALLBACKS pnp;
     WDF_FILEOBJECT_CONFIG files;
     WDF_IO_QUEUE_CONFIG queue;
+    WDF_TIMER_CONFIG timer;
     NTSTATUS status;
     DECLARE_CONST_UNICODE_STRING(name, PI5_FCLK_NAME);
     DECLARE_CONST_UNICODE_STRING(link, L"\\DosDevices\\Pi5Fclk");
@@ -352,17 +485,28 @@ NTSTATUS FclkAdd(WDFDRIVER driver, PWDFDEVICE_INIT init)
     pnp.EvtDeviceQueryStop = FclkQueryStop;
     pnp.EvtDeviceQueryRemove = FclkQueryRemove;
     WdfDeviceInitSetPnpPowerEventCallbacks(init, &pnp);
+    {
+        UCHAR minor = IRP_MN_QUERY_DEVICE_RELATIONS;
+        status = WdfDeviceInitAssignWdmIrpPreprocessCallback(init, FclkPowerRelations, IRP_MJ_PNP, &minor, 1);
+        if (!NT_SUCCESS(status)) return status;
+    }
     WDF_FILEOBJECT_CONFIG_INIT(&files, WDF_NO_EVENT_CALLBACK, WDF_NO_EVENT_CALLBACK, FclkCleanup);
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, FCLK_FILE);
     attributes.ExecutionLevel = WdfExecutionLevelPassive;
     WdfDeviceInitSetFileObjectConfig(init, &files, &attributes);
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, FCLK_CONTEXT);
     attributes.ExecutionLevel = WdfExecutionLevelPassive;
+    attributes.SynchronizationScope = WdfSynchronizationScopeNone;
     status = WdfDeviceCreate(&init, &attributes, &device);
     if (!NT_SUCCESS(status)) return status;
     FclkContext(device)->Device = device;
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes); attributes.ParentObject = device;
     status = WdfWaitLockCreate(&attributes, &FclkContext(device)->Lock);
+    if (!NT_SUCCESS(status)) return status;
+    WDF_TIMER_CONFIG_INIT(&timer, FclkArmTimer);
+    timer.AutomaticSerialization = FALSE;
+    attributes.ExecutionLevel = WdfExecutionLevelPassive;
+    status = WdfTimerCreate(&timer, &attributes, &FclkContext(device)->ArmTimer);
     if (!NT_SUCCESS(status)) return status;
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queue, WdfIoQueueDispatchSequential);
     queue.EvtIoDeviceControl = FclkIo;
@@ -386,9 +530,10 @@ NTSTATUS FclkReleaseHardware(WDFDEVICE device, WDFCMRESLIST translated)
     NTSTATUS status;
     UNREFERENCED_PARAMETER(translated);
     WdfWaitLockAcquire(c->Lock, NULL);
-    status = Busy(c) ? STATUS_DEVICE_BUSY : STATUS_SUCCESS;
+    status = Busy(c) || c->ArmClaimed ? STATUS_DEVICE_BUSY : STATUS_SUCCESS;
     if (NT_SUCCESS(status) && c->Mailbox) {
         WdfObjectDelete(c->Mailbox); c->Mailbox = NULL;
+        IoInvalidateDeviceRelations(WdfDeviceWdmGetPhysicalDevice(device), PowerRelations);
     }
     WdfWaitLockRelease(c->Lock);
     return status;
@@ -407,6 +552,8 @@ NTSTATUS FclkStart(WDFDEVICE device, WDF_POWER_DEVICE_STATE previous)
      * a client query/acquire retries OpenMailbox after its provider starts. */
     status = Snapshot(c, PI5_FCLK_V3D, &initial);
     c->StartupStatus = (ULONG)status;
+    c->ArmAttempts = 0;
+    WdfTimerStart(c->ArmTimer, WDF_REL_TIMEOUT_IN_MS(100));
     Diagnostic(device, c);
     WdfWaitLockRelease(c->Lock);
     return STATUS_SUCCESS;
@@ -418,9 +565,20 @@ NTSTATUS FclkStop(WDFDEVICE device, WDF_POWER_DEVICE_STATE target)
     FCLK_CONTEXT *c = FclkContext(device);
     NTSTATUS status;
     UNREFERENCED_PARAMETER(target);
+    /* The passive callback uses Lock; never wait for it while holding Lock. */
+    WdfWaitLockAcquire(c->Lock, NULL);
+    c->Online = FALSE;
+    WdfWaitLockRelease(c->Lock);
+    (void)WdfTimerStop(c->ArmTimer, TRUE);
     WdfWaitLockAcquire(c->Lock, NULL);
     status = Busy(c) ? STATUS_DEVICE_BUSY : STATUS_SUCCESS;
-    if (NT_SUCCESS(status)) c->Online = FALSE;
+    if (NT_SUCCESS(status)) status = ArmRestore(device, c);
+    if (!NT_SUCCESS(status)) {
+        c->Online = TRUE;
+        if (!c->ArmReady && !c->ArmUncertain)
+            WdfTimerStart(c->ArmTimer, WDF_REL_TIMEOUT_IN_SEC(1));
+    }
+    Diagnostic(device, c);
     WdfWaitLockRelease(c->Lock);
     return status;
 }

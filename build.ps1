@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# Build the ARM64 kernel drivers from a local checkout with MSVC and the WDK.
+# Build the ARM64 drivers from a local checkout with MSVC and the WDK.
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'source', 'rp1', 'nvme', 'rp1-service', 'rp1-clocks', 'rp1-gpio', 'rp1-uart', 'rp1-i2c', 'rp1-spi', 'rp1-dma', 'rp1-ethernet', 'bcm2712-platform', 'bcm2712-gpio', 'bcm2712-uart', 'cyw-bluetooth', 'pi5-board', 'pi5-graph', 'pi5-mailbox', 'pi5-fclk', 'pi5-pm', 'pi5-iommu','pi5-v3d', 'rp1-fan', 'pi5-nvram')]
+    [ValidateSet('all', 'source', 'rp1', 'nvme', 'rp1-service', 'rp1-clocks', 'rp1-gpio', 'rp1-uart', 'rp1-i2c', 'rp1-spi', 'rp1-dma', 'rp1-ethernet', 'bcm2712-platform', 'bcm2712-gpio', 'bcm2712-uart', 'cyw-bluetooth', 'pi5-board', 'pi5-graph', 'pi5-mailbox', 'pi5-fclk', 'pi5-pm', 'pi5-iommu', 'pi5-v3d', 'pi5-graphics', 'rp1-fan', 'pi5-nvram')]
     [string]$Driver = 'all',
     [string]$Output = (Join-Path $PSScriptRoot 'Build'),
     [string]$FirmwareRoot = '',
@@ -52,6 +52,18 @@ $sign = Join-Path $WdkRoot "bin\$SdkVersion\x64\signtool.exe"
 function Require-File([string]$Path) {
     if (!$Path -or !(Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Missing build prerequisite: $Path" }
 }
+function Set-PackageIdentity([string]$Directory) {
+    # Windows deduplicates packages by INF content. Reusing an unchanged INF can
+    # silently select an older binary even when DevCon forces an update.
+    $identity = @("; Build configuration: $Configuration")
+    foreach ($file in Get-ChildItem $Directory -File | Where-Object Extension -in '.sys','.dll' | Sort-Object Name) {
+        $identity += "; $($file.Name) SHA256: $((Get-FileHash $file.FullName -Algorithm SHA256).Hash)"
+    }
+    foreach ($inf in Get-ChildItem $Directory -Filter *.inf) {
+        $contents = [IO.File]::ReadAllText($inf.FullName).TrimEnd() + "`r`n" + ($identity -join "`r`n") + "`r`n"
+        [IO.File]::WriteAllText($inf.FullName, $contents, [Text.Encoding]::Unicode)
+    }
+}
 Require-File (Join-Path $kernelInclude 'ntddk.h')
 Require-File (Join-Path $kernelLib 'ntoskrnl.lib')
 Require-File (Join-Path $kernelLib 'BufferOverflowFastFailK.lib')
@@ -61,7 +73,7 @@ if ($CertificateThumbprint) {
     Require-File $sign
 }
 $rp1Drivers = @('rp1-service','rp1-clocks','rp1-gpio','rp1-uart','rp1-i2c','rp1-spi','rp1-dma','rp1-ethernet','rp1-fan')
-$names = if ($Driver -in 'all','source') { $rp1Drivers + @('bcm2712-platform','bcm2712-gpio','bcm2712-uart','cyw-bluetooth','pi5-board','pi5-graph','pi5-mailbox','pi5-fclk','pi5-pm','pi5-iommu','pi5-v3d','pi5-nvram') } elseif ($Driver -eq 'rp1') { $rp1Drivers } else { @($Driver) }
+$names = if ($Driver -in 'all','source') { $rp1Drivers + @('bcm2712-platform','bcm2712-gpio','bcm2712-uart','cyw-bluetooth','pi5-board','pi5-graph','pi5-mailbox','pi5-fclk','pi5-pm','pi5-iommu','pi5-v3d','pi5-graphics','pi5-nvram') } elseif ($Driver -eq 'rp1') { $rp1Drivers } else { @($Driver) }
 if ($Driver -eq 'all') { $names = @('nvme') + $names }
 if ('pi5-nvram' -in $names) {
     if (!$FirmwareRoot) { throw 'Supply -FirmwareRoot with the path to the matching rpi5-uefi checkout to build the NVRAM driver.' }
@@ -92,6 +104,7 @@ foreach ($name in $names) {
             & $sign sign /fd SHA256 /s My /sha1 $CertificateThumbprint "$work\stornvme.sys"
             if ($LASTEXITCODE) { throw 'NVMe driver signing failed' }
         }
+        Set-PackageIdentity $work
         & $Inf2Cat "/driver:$work" /os:10_GE_ARM64
         if ($LASTEXITCODE) { throw 'NVMe catalog generation failed' }
         if ($CertificateThumbprint) {
@@ -110,6 +123,35 @@ foreach ($name in $names) {
         Require-File (Join-Path $kmdfInclude 'wdf.h')
         Require-File (Join-Path $kmdfLib 'wdfdriverentry.lib')
         Require-File (Join-Path $kmdfLib 'wdfldr.lib')
+    }
+    if ($name -eq 'pi5-graphics') {
+        Require-File (Join-Path $kernelLib 'displib.lib')
+        $work = Join-Path $Output ('.work\pi5-graphics-' + [Guid]::NewGuid().ToString('N'))
+        $graphicsArguments = @{
+            Work = $work; Init = $init; KernelInclude = $kernelInclude; KernelLib = $kernelLib
+            KmdfInclude = $kmdfInclude; KmdfLib = $kmdfLib
+            Configuration = $Configuration; Analyze = $Analyze
+        }
+        & (Join-Path $PSScriptRoot 'pi5-graphics\build.ps1') @graphicsArguments
+        $staging = Join-Path $work 'package'
+        if ($CertificateThumbprint) {
+            foreach ($file in Get-ChildItem $staging -File | Where-Object Extension -in '.sys','.dll') {
+                & $sign sign /fd SHA256 /s My /sha1 $CertificateThumbprint $file.FullName
+                if ($LASTEXITCODE) { throw "Graphics signing failed: $file" }
+            }
+        }
+        Set-PackageIdentity $staging
+        & $Inf2Cat "/driver:$staging" /os:10_GE_ARM64
+        if ($LASTEXITCODE) { throw 'Graphics catalog generation failed' }
+        if ($CertificateThumbprint) {
+            & $sign sign /fd SHA256 /s My /sha1 $CertificateThumbprint "$staging\pi5graphics.cat"
+            if ($LASTEXITCODE) { throw 'Graphics catalog signing failed' }
+        }
+        $package = Join-Path $Output $name
+        New-Item $package -ItemType Directory -Force | Out-Null
+        Copy-Item "$staging\*" $package -Force
+        Write-Host "Built $name -> $package"
+        continue
     }
     $binary = switch ($name) {
         'rp1-service' { 'Pi5Rp1' }
@@ -234,6 +276,7 @@ foreach ($name in $names) {
             & $sign sign /fd SHA256 /s My /sha1 $CertificateThumbprint "$staging\$binary.sys"
             if ($LASTEXITCODE) { throw "$name driver signing failed" }
         }
+        Set-PackageIdentity $staging
         & $Inf2Cat "/driver:$staging" /os:10_GE_ARM64
         if ($LASTEXITCODE) { throw "$name catalog generation failed" }
         if ($CertificateThumbprint) {
