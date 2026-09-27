@@ -117,10 +117,25 @@ foreach ($file in Get-ChildItem $symbolsRoot -Recurse -File | Sort-Object FullNa
     ConvertTo-Json -Depth 8 | Set-Content (Join-Path $symbolsRoot 'manifest.json') -Encoding UTF8
 
 # Publish only completed ZIPs; build intermediates never enter either archive.
+function Write-ReleaseArchive([string]$Root, [string]$Destination) {
+    Add-Type -AssemblyName System.IO.Compression,System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::Open($Destination, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($file in Get-ChildItem -LiteralPath $Root -Recurse -File | Sort-Object FullName) {
+            # ZIP entry names use forward slashes on every platform. Windows
+            # PowerShell's Compress-Archive can preserve native backslashes.
+            $entryName = $file.FullName.Substring($Root.Length + 1).Replace('\','/')
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $zip, $file.FullName, $entryName, [IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
 $temporaryArchive = Join-Path $buildRoot 'drivers.zip'
 $temporarySymbols = Join-Path $buildRoot 'symbols.zip'
-Compress-Archive -Path "$packageRoot\*" -DestinationPath $temporaryArchive -CompressionLevel Optimal
-Compress-Archive -Path "$symbolsRoot\*" -DestinationPath $temporarySymbols -CompressionLevel Optimal
+Write-ReleaseArchive -Root $packageRoot -Destination $temporaryArchive
+Write-ReleaseArchive -Root $symbolsRoot -Destination $temporarySymbols
 Move-Item $temporaryArchive $archive
 Move-Item $temporarySymbols $symbolArchive
 foreach ($path in @($archive,$symbolArchive)) {
