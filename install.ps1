@@ -84,6 +84,12 @@ foreach ($package in $manifest.Packages) {
     $needsReboot = $false
     if (![Pi5DriverInstall]::DiInstallDriverW([IntPtr]::Zero, (Package-Path $package.Inf), 0, [ref]$needsReboot)) {
         $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        # All packages were staged above. Windows may report no better matching
+        # driver when the existing package has the same or a higher rank.
+        if ($errorCode -eq 259) {
+            Write-Host "Package staged; Windows retained the preferred driver for $($package.Name)."
+            continue
+        }
         throw "Installation failed: $($package.Name): $([ComponentModel.Win32Exception]::new($errorCode).Message) ($errorCode)"
     }
     if ($needsReboot) { $reboot = $true }
