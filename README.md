@@ -3,7 +3,6 @@
 Drivers for Raspberry Pi 5 with the matching [rpi5-uefi firmware](https://github.com/damian5466/rpi5-uefi).
 
 Tested on **Windows 11 Pro 25H2 ARM64, build 26200.9539**.
-You can create a Windows ISO with these drivers using [rpi5-windows-builder](https://github.com/damian5466/rpi5-windows-builder).
 
 | Driver | Documentation |
 | --- | --- |
